@@ -1,0 +1,11 @@
+export * as UserModel        from './user.model';
+export * as ClientModel      from './client.model';
+export * as EmployeeModel    from './employee.model';
+export * as TaskModel        from './task.model';
+export * as AttendanceModel  from './attendance.model';
+export * as LeaveModel       from './leave.model';
+export * as PayrollModel     from './payroll.model';
+export * as InvoiceModel     from './invoice.model';
+export * as WorkspaceModel   from './workspace.model';
+export * as NotifModel       from './notification.model';
+export * as ActivityModel    from './activity.model';

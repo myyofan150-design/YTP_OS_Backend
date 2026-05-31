@@ -1,0 +1,9 @@
+node_modules
+dist
+.env
+.env.production
+uploads/*
+!uploads/.gitkeep
+prisma
+prisma.config.ts
+*.zip
