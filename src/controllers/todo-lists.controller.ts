@@ -233,7 +233,7 @@ export async function getList(req: Request, res: Response): Promise<void> {
 
     const tasks = await q<RowDataPacket>(
       `SELECT
-         t.id, t.uuid, t.title, t.status, t.priority,
+         t.id, t.uuid, t.title, t.status, t.priority, t.stage,
          t.due_date AS dueDate, t.bg_color AS bgColor, t.is_favorite AS isFavorite,
          t.sort_order AS sortOrder, t.assigned_to AS assignedTo, t.completed_at AS completedAt,
          COUNT(s.id) AS subtaskTotal,
@@ -244,8 +244,7 @@ export async function getList(req: Request, res: Response): Promise<void> {
        GROUP BY t.id
        ORDER BY
          CASE t.status WHEN 'completed' THEN 1 ELSE 0 END ASC,
-         t.sort_order ASC,
-         CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END ASC`,
+         t.sort_order ASC`,
       [listId]
     );
 

@@ -5,6 +5,7 @@ import { encrypt, decrypt } from "../lib/encryption";
 import { logActivity } from "../lib/logger";
 import { rowToSubscription } from "../lib/subscription-db";
 import { runExpiryCheck } from "../jobs/subscription-expiry.job";
+import { uploadFile } from "../lib/storage";
 
 // ─── Shared SQL fragments ─────────────────────────────────────────────────────
 
@@ -18,7 +19,7 @@ const SUB_SEL = `
   s.category_id      AS categoryId,
   s.billing_cycle_id AS billingCycleId,
   s.status_id        AS statusId,
-  s.price, s.currency, s.autopay, s.plan_tier AS planTier, s.usage_type AS usageType, s.remarks,
+  s.price, s.next_renewal_amount AS nextRenewalAmount, s.currency, s.autopay, s.plan_tier AS planTier, s.usage_type AS usageType, s.remarks,
   s.created_by       AS createdBy,
   s.created_at       AS createdAt,
   cat.uuid           AS catUuid,
@@ -103,7 +104,7 @@ export async function createSubscription(req: Request, res: Response): Promise<v
       name, logoUrl, link, username, password,
       startDate, endDate,
       categoryId, billingCycleId, statusId,
-      price, currency, autopay, planTier, usageType, remarks,
+      price, nextRenewalAmount, currency, autopay, planTier, usageType, remarks,
     } = req.body as Record<string, unknown>;
 
     if (!name || !startDate || !endDate) {
@@ -129,8 +130,8 @@ export async function createSubscription(req: Request, res: Response): Promise<v
       `INSERT INTO subscriptions
          (name, logo_url, link, username, password_encrypted,
           start_date, end_date, category_id, billing_cycle_id, status_id,
-          price, currency, autopay, plan_tier, usage_type, remarks, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          price, next_renewal_amount, currency, autopay, plan_tier, usage_type, remarks, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         name,
         logoUrl  ?? null,
@@ -142,7 +143,8 @@ export async function createSubscription(req: Request, res: Response): Promise<v
         categoryId     != null ? Number(categoryId)     : null,
         billingCycleId != null ? Number(billingCycleId) : null,
         statusId       != null ? Number(statusId)       : null,
-        price != null ? Number(price) : null,
+        price             != null ? Number(price)             : null,
+        nextRenewalAmount != null ? Number(nextRenewalAmount) : null,
         currency ?? "INR",
         autopay ? 1 : 0,
         planTier  ?? null,
@@ -209,7 +211,7 @@ export async function updateSubscription(req: Request, res: Response): Promise<v
       name, logoUrl, link, username, password,
       startDate, endDate,
       categoryId, billingCycleId, statusId,
-      price, currency, autopay, planTier, usageType, remarks,
+      price, nextRenewalAmount, currency, autopay, planTier, usageType, remarks,
     } = req.body as Record<string, unknown>;
 
     if (categoryId != null && !(await validateMetaId(Number(categoryId), "category"))) {
@@ -238,7 +240,8 @@ export async function updateSubscription(req: Request, res: Response): Promise<v
     if (categoryId    !== undefined) { sets.push("category_id = ?");         params.push(categoryId != null ? Number(categoryId) : null); }
     if (billingCycleId !== undefined){ sets.push("billing_cycle_id = ?");    params.push(billingCycleId != null ? Number(billingCycleId) : null); }
     if (statusId      !== undefined) { sets.push("status_id = ?");           params.push(statusId != null ? Number(statusId) : null); }
-    if (price         !== undefined) { sets.push("price = ?");               params.push(price != null ? Number(price) : null); }
+    if (price             !== undefined) { sets.push("price = ?");                params.push(price != null ? Number(price) : null); }
+    if (nextRenewalAmount !== undefined) { sets.push("next_renewal_amount = ?"); params.push(nextRenewalAmount != null ? Number(nextRenewalAmount) : null); }
     if (currency      !== undefined) { sets.push("currency = ?");            params.push(currency); }
     if (autopay       !== undefined) { sets.push("autopay = ?");             params.push(autopay ? 1 : 0); }
     if (planTier      !== undefined) { sets.push("plan_tier = ?");           params.push(planTier ?? null); }
@@ -403,7 +406,7 @@ export async function exportCsv(req: Request, res: Response): Promise<void> {
 
     const csvEsc = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
 
-    const header = ["Name", "Category", "Billing Cycle", "Status", "Price", "Currency", "Start Date", "End Date", "Days Left", "Autopay"].join(",");
+    const header = ["Name", "Category", "Billing Cycle", "Status", "Price", "Next Renewal Amount", "Currency", "Start Date", "End Date", "Days Left", "Autopay"].join(",");
     const lines = rows.map(r => {
       const s = rowToSubscription(r);
       return [
@@ -412,6 +415,7 @@ export async function exportCsv(req: Request, res: Response): Promise<void> {
         csvEsc(s.billingCycle?.label ?? ""),
         csvEsc(s.status?.label       ?? ""),
         s.price ?? "",
+        s.nextRenewalAmount ?? "",
         s.currency,
         s.startDate,
         s.endDate,
@@ -450,7 +454,7 @@ export async function uploadSubscriptionLogo(req: Request, res: Response): Promi
       return;
     }
 
-    const logoUrl = `uploads/subscription-logos/${req.file.filename}`;
+    const { url: logoUrl } = await uploadFile(req.file.buffer, { folder: "subscription-logos", filename: req.file.originalname, mimetype: req.file.mimetype });
     await run("UPDATE subscriptions SET logo_url = ? WHERE id = ?", [logoUrl, subId]);
 
     const rows = await q<RowDataPacket>(

@@ -2,9 +2,9 @@
 
 import { Request, Response } from "express";
 import path from "path";
-import fs from "fs";
 import { q, run, pool, RowDataPacket } from "../lib/db";
 import { logActivity } from "../lib/logger";
+import { uploadFile, deleteFile } from "../lib/storage";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -27,7 +27,7 @@ async function logTodo(taskId: number, userId: number, action: string, detail: s
 // Resolve task UUID → row; returns null if not found
 async function resolveTask(uuid: string): Promise<RowDataPacket | null> {
   const rows = await q<RowDataPacket>(
-    `SELECT t.id, t.uuid, t.title, t.description, t.status, t.priority,
+    `SELECT t.id, t.uuid, t.title, t.description, t.status, t.priority, t.stage,
             t.due_date AS dueDate, t.due_time AS dueTime, t.reminder_at AS reminderAt,
             t.repeat_type AS repeatType, t.repeat_config AS repeatConfig,
             t.bg_color AS bgColor, t.is_favorite AS isFavorite,
@@ -76,7 +76,7 @@ async function setTodoTaskMembers(taskId: number, memberIds: number[], addedById
   await run("DELETE FROM todo_task_members WHERE task_id = ?", [taskId]);
   for (const uid of memberIds) {
     await run(
-      "INSERT IGNORE INTO todo_task_members (task_id, user_id, added_by_id) VALUES (?, ?, ?)",
+      "INSERT IGNORE INTO todo_task_members (task_id, user_id, added_by) VALUES (?, ?, ?)",
       [taskId, uid, addedById]
     );
   }
@@ -130,8 +130,16 @@ export async function listTasks(req: Request, res: Response): Promise<void> {
     }
 
     if (!showAll) {
-      conditions.push("(t.created_by = ? OR t.assigned_to = ?)");
-      params.push(userId, userId);
+      // Employee sees tasks they own, are assigned to directly, are a task-member of,
+      // are a list-member of, or whose list is assigned to them.
+      conditions.push(
+        `(t.created_by = ?
+          OR t.assigned_to = ?
+          OR EXISTS (SELECT 1 FROM todo_task_members tm WHERE tm.task_id = t.id AND tm.user_id = ?)
+          OR EXISTS (SELECT 1 FROM todo_list_members lm WHERE lm.list_id = t.list_id AND lm.user_id = ?)
+          OR EXISTS (SELECT 1 FROM todo_lists tl WHERE tl.id = t.list_id AND tl.assigned_to = ?))`
+      );
+      params.push(userId, userId, userId, userId, userId);
     }
 
     const { search, status, priority, dueDate } = req.query as Record<string, string | undefined>;
@@ -177,13 +185,15 @@ export async function createTask(req: Request, res: Response): Promise<void> {
     const userId   = req.user!.id;
 
     const lRows = await q<RowDataPacket>(
-      "SELECT id FROM todo_lists WHERE uuid = ? AND (created_by = ? OR assigned_to = ?)",
-      [listUuid, userId, userId]
+      `SELECT l.id FROM todo_lists l WHERE l.uuid = ?
+       AND (l.created_by = ? OR l.assigned_to = ?
+            OR EXISTS (SELECT 1 FROM todo_list_members lm WHERE lm.list_id = l.id AND lm.user_id = ?))`,
+      [listUuid, userId, userId, userId]
     );
     if (!lRows[0]) { res.status(404).json({ success: false, message: "List not found" }); return; }
     const listId = Number(lRows[0]["id"]);
 
-    const { title, description, priority, dueDate, dueTime, bgColor, assignedTo, memberIds } =
+    const { title, description, priority, stage, dueDate, dueTime, bgColor, assignedTo, memberIds } =
       req.body as Record<string, unknown>;
     if (!title) { res.status(400).json({ success: false, message: "title is required" }); return; }
 
@@ -192,13 +202,14 @@ export async function createTask(req: Request, res: Response): Promise<void> {
 
     const result = await run(
       `INSERT INTO todo_tasks
-         (list_id, title, description, priority, due_date, due_time, bg_color, assigned_to, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (list_id, title, description, priority, stage, due_date, due_time, bg_color, assigned_to, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         listId,
         String(title),
         description ? String(description) : null,
         priority    ? String(priority)    : "none",
+        stage       ? String(stage)       : "inprogress",
         dueDate     ? String(dueDate)     : null,
         dueTime     ? String(dueTime)     : null,
         bgColor     ? String(bgColor)     : "default",
@@ -219,7 +230,7 @@ export async function createTask(req: Request, res: Response): Promise<void> {
     await logActivity(userId, "todo.task_created", "todo_task", taskId, undefined, { title }, req.ip);
 
     const rows = await q<RowDataPacket>(
-      `SELECT t.id, t.uuid, t.title, t.description, t.status, t.priority,
+      `SELECT t.id, t.uuid, t.title, t.description, t.status, t.priority, t.stage,
               t.due_date AS dueDate, t.due_time AS dueTime, t.reminder_at AS reminderAt,
               t.repeat_type AS repeatType, t.repeat_config AS repeatConfig,
               t.bg_color AS bgColor, t.is_favorite AS isFavorite,
@@ -252,7 +263,14 @@ export async function getTask(req: Request, res: Response): Promise<void> {
     if (!task) { res.status(404).json({ success: false, message: "Task not found" }); return; }
 
     if (!isAdmin && Number(task["createdBy"]) !== userId && Number(task["assignedTo"]) !== userId) {
-      res.status(403).json({ success: false, message: "Forbidden" }); return;
+      const accessRow = await q<RowDataPacket>(
+        `SELECT 1 FROM todo_task_members WHERE task_id = ? AND user_id = ?
+         UNION ALL SELECT 1 FROM todo_list_members WHERE list_id = ? AND user_id = ?
+         UNION ALL SELECT 1 FROM todo_lists WHERE id = ? AND assigned_to = ?
+         LIMIT 1`,
+        [task["id"], userId, task["listId"], userId, task["listId"], userId]
+      );
+      if (!accessRow[0]) { res.status(403).json({ success: false, message: "Forbidden" }); return; }
     }
 
     const [subtasks, attachments, noteRows, activityRows] = await Promise.all([
@@ -340,7 +358,13 @@ export async function updateTask(req: Request, res: Response): Promise<void> {
     const isAssigned = Number(task["assignedTo"]) === userId;
 
     if (!isCreator && !isAdmin) {
-      if (!isAssigned) { res.status(403).json({ success: false, message: "Forbidden" }); return; }
+      if (!isAssigned) {
+        const memberRow = await q<RowDataPacket>(
+          "SELECT 1 FROM todo_task_members WHERE task_id = ? AND user_id = ? LIMIT 1",
+          [task["id"], userId]
+        );
+        if (!memberRow[0]) { res.status(403).json({ success: false, message: "Forbidden" }); return; }
+      }
       // Assigned-only users can change only status
       const bodyKeys = Object.keys(req.body as Record<string, unknown>);
       if (bodyKeys.some(k => k !== "status")) {
@@ -348,7 +372,7 @@ export async function updateTask(req: Request, res: Response): Promise<void> {
       }
     }
 
-    const { title, description, status, priority, dueDate, dueTime,
+    const { title, description, status, priority, stage, dueDate, dueTime,
             bgColor, isFavorite, assignedTo, sortOrder, repeatType, memberIds, listId } =
       req.body as Record<string, unknown>;
 
@@ -358,6 +382,7 @@ export async function updateTask(req: Request, res: Response): Promise<void> {
     if (title       != null) { sets.push("title = ?");       p.push(String(title)); }
     if (description != null) { sets.push("description = ?"); p.push(description ? String(description) : null); }
     if (priority    != null) { sets.push("priority = ?");    p.push(String(priority)); }
+    if (stage       != null) { sets.push("stage = ?");       p.push(String(stage)); }
     if (dueDate     !== undefined) { sets.push("due_date = ?");  p.push(dueDate  ? String(dueDate)  : null); }
     if (dueTime     !== undefined) { sets.push("due_time = ?");  p.push(dueTime  ? String(dueTime)  : null); }
     if (bgColor     != null) { sets.push("bg_color = ?");    p.push(String(bgColor)); }
@@ -448,14 +473,12 @@ export async function deleteTask(req: Request, res: Response): Promise<void> {
       }
     }
 
-    // Delete physical attachment files before cascading DB delete
+    // Delete attachment files from cloud storage before cascading DB delete
     const attachments = await q<RowDataPacket>(
       "SELECT file_path AS filePath FROM todo_attachments WHERE task_id = ?",
       [task["id"]]
     );
-    for (const att of attachments) {
-      try { fs.unlinkSync(path.join(process.cwd(), String(att["filePath"]))); } catch { /* gone */ }
-    }
+    await Promise.all(attachments.map(att => deleteFile(String(att["filePath"]))));
 
     await run("DELETE FROM todo_tasks WHERE id = ?", [task["id"]]);
     await logActivity(userId, "todo.task_deleted", "todo_task", Number(task["id"]), { title: task["title"] }, undefined, req.ip);
@@ -480,7 +503,11 @@ export async function updateTaskStatus(req: Request, res: Response): Promise<voi
     const isAssigned = Number(task["assignedTo"]) === userId;
     const isAdmin    = ["SUPER_ADMIN", "ADMIN"].includes(req.user!.role);
     if (!isCreator && !isAssigned && !isAdmin) {
-      res.status(403).json({ success: false, message: "Forbidden" }); return;
+      const memberRow = await q<RowDataPacket>(
+        "SELECT 1 FROM todo_task_members WHERE task_id = ? AND user_id = ? LIMIT 1",
+        [task["id"], userId]
+      );
+      if (!memberRow[0]) { res.status(403).json({ success: false, message: "Forbidden" }); return; }
     }
 
     const newStatus = task["status"] === "pending" ? "completed" : "pending";
@@ -590,7 +617,11 @@ export async function listSubtasks(req: Request, res: Response): Promise<void> {
     if (!task) { res.status(404).json({ success: false, message: "Task not found" }); return; }
     if (Number(task["createdBy"]) !== userId && Number(task["assignedTo"]) !== userId
         && !["SUPER_ADMIN", "ADMIN"].includes(req.user!.role)) {
-      res.status(403).json({ success: false, message: "Forbidden" }); return;
+      const memberRow = await q<RowDataPacket>(
+        "SELECT 1 FROM todo_task_members WHERE task_id = ? AND user_id = ? LIMIT 1",
+        [task["id"], userId]
+      );
+      if (!memberRow[0]) { res.status(403).json({ success: false, message: "Forbidden" }); return; }
     }
 
     const subtasks = await q<RowDataPacket>(
@@ -754,7 +785,6 @@ export async function uploadAttachment(req: Request, res: Response): Promise<voi
 
     const ext = path.extname(req.file.originalname).toLowerCase();
     if (!ALLOWED_ATTACHMENT_EXTS.includes(ext)) {
-      fs.unlinkSync(req.file.path);
       res.status(400).json({
         success: false,
         message: `File type not allowed. Allowed: ${ALLOWED_ATTACHMENT_EXTS.join(", ")}`,
@@ -763,18 +793,17 @@ export async function uploadAttachment(req: Request, res: Response): Promise<voi
 
     const task = await resolveTask(uuid);
     if (!task) {
-      fs.unlinkSync(req.file.path);
       res.status(404).json({ success: false, message: "Task not found" }); return;
     }
 
-    const relativePath = `uploads/todo-attachments/${req.file.filename}`;
+    const { url } = await uploadFile(req.file.buffer, { folder: "todo-attachments", filename: req.file.originalname, mimetype: req.file.mimetype });
     const result = await run(
       `INSERT INTO todo_attachments (task_id, file_name, file_path, file_size, file_type, uploaded_by)
        VALUES (?, ?, ?, ?, ?, ?)`,
       [
         task["id"],
         req.file.originalname,
-        relativePath,
+        url,
         req.file.size,
         ext.replace(".", ""),
         userId,
@@ -817,7 +846,7 @@ export async function deleteAttachment(req: Request, res: Response): Promise<voi
       res.status(403).json({ success: false, message: "Forbidden" }); return;
     }
 
-    try { fs.unlinkSync(path.join(process.cwd(), String(attRows[0]["filePath"]))); } catch { /* gone */ }
+    await deleteFile(String(attRows[0]["filePath"]));
     await run("DELETE FROM todo_attachments WHERE id = ?", [attRows[0]["id"]]);
     await logTodo(Number(task["id"]), userId, "attachment_removed", "Attachment removed");
     res.json({ success: true, message: "Attachment deleted", data: null });
@@ -837,14 +866,8 @@ export async function downloadAttachment(req: Request, res: Response): Promise<v
     );
     if (!rows[0]) { res.status(404).json({ success: false, message: "Attachment not found" }); return; }
 
-    const absPath = path.join(process.cwd(), String(rows[0]["filePath"]));
-    if (!fs.existsSync(absPath)) {
-      res.status(404).json({ success: false, message: "File not found on disk" }); return;
-    }
-
     res.setHeader("Content-Disposition", `attachment; filename="${rows[0]["fileName"]}"`);
-    res.setHeader("Content-Type", "application/octet-stream");
-    fs.createReadStream(absPath).pipe(res as unknown as NodeJS.WritableStream);
+    res.redirect(String(rows[0]["filePath"]));
   } catch (err) {
     console.error("[todo-tasks/attachments/download]", err);
     res.status(500).json({ success: false, message: "Internal server error" });
@@ -1057,9 +1080,13 @@ export async function getSmartView(req: Request, res: Response): Promise<void> {
            FROM todo_tasks t
            JOIN todo_lists l ON l.id = t.list_id
            WHERE t.due_date = CURDATE()
-             AND (t.created_by = ? OR t.assigned_to = ?)
+             AND (t.created_by = ?
+                  OR t.assigned_to = ?
+                  OR EXISTS (SELECT 1 FROM todo_task_members tm WHERE tm.task_id = t.id AND tm.user_id = ?)
+                  OR EXISTS (SELECT 1 FROM todo_list_members lm WHERE lm.list_id = t.list_id AND lm.user_id = ?)
+                  OR EXISTS (SELECT 1 FROM todo_lists tl WHERE tl.id = t.list_id AND tl.assigned_to = ?))
            ORDER BY t.sort_order ASC`,
-          [userId, userId]
+          [userId, userId, userId, userId, userId]
         );
         res.json({ success: true, message: "OK", data: tasks }); break;
       }
@@ -1071,11 +1098,12 @@ export async function getSmartView(req: Request, res: Response): Promise<void> {
            FROM todo_tasks t
            JOIN todo_lists l ON l.id = t.list_id
            JOIN users u ON u.id = t.created_by
-           WHERE t.assigned_to = ?
-             AND t.status = 'pending'
+           WHERE t.status = 'pending'
              AND t.created_by != ?
+             AND (t.assigned_to = ?
+                  OR EXISTS (SELECT 1 FROM todo_task_members tm WHERE tm.task_id = t.id AND tm.user_id = ?))
            ORDER BY t.due_date ASC, t.sort_order ASC`,
-          [userId, userId]
+          [userId, userId, userId]
         );
         res.json({ success: true, message: "OK", data: tasks }); break;
       }
@@ -1128,9 +1156,13 @@ export async function getSmartView(req: Request, res: Response): Promise<void> {
            JOIN todo_lists l ON l.id = t.list_id
            WHERE t.due_date < CURDATE()
              AND t.status = 'pending'
-             AND (t.created_by = ? OR t.assigned_to = ?)
+             AND (t.created_by = ?
+                  OR t.assigned_to = ?
+                  OR EXISTS (SELECT 1 FROM todo_task_members tm WHERE tm.task_id = t.id AND tm.user_id = ?)
+                  OR EXISTS (SELECT 1 FROM todo_list_members lm WHERE lm.list_id = t.list_id AND lm.user_id = ?)
+                  OR EXISTS (SELECT 1 FROM todo_lists tl WHERE tl.id = t.list_id AND tl.assigned_to = ?))
            ORDER BY t.due_date ASC`,
-          [userId, userId]
+          [userId, userId, userId, userId, userId]
         );
         res.json({ success: true, message: "OK", data: tasks }); break;
       }

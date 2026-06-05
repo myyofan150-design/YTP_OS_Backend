@@ -13,6 +13,12 @@ export interface TokenPayload {
   email: string;
 }
 
+export interface TempTokenPayload {
+  id: number;
+  email: string;
+  scope: "2fa_pending";
+}
+
 export function signToken(payload: TokenPayload): string {
   return jwt.sign(payload, JWT_SECRET, {
     expiresIn: JWT_EXPIRES_IN as jwt.SignOptions["expiresIn"],
@@ -21,4 +27,15 @@ export function signToken(payload: TokenPayload): string {
 
 export function verifyToken(token: string): TokenPayload {
   return jwt.verify(token, JWT_SECRET) as TokenPayload;
+}
+
+// Short-lived token issued after password check, before 2FA verification
+export function signTempToken(payload: Omit<TempTokenPayload, "scope">): string {
+  return jwt.sign({ ...payload, scope: "2fa_pending" }, JWT_SECRET, { expiresIn: "10m" });
+}
+
+export function verifyTempToken(token: string): TempTokenPayload {
+  const decoded = jwt.verify(token, JWT_SECRET) as TempTokenPayload;
+  if (decoded.scope !== "2fa_pending") throw new Error("Invalid token scope");
+  return decoded;
 }

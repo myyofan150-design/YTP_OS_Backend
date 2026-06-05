@@ -37,14 +37,14 @@ app.use(
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ─── Static File Serving (uploads) ───────────────────────────────────────
-// Allow cross-origin image/file loads (helmet sets same-origin by default)
-// Use UPLOAD_DIR env var so this matches wherever multer actually saves files.
-const uploadsDir = process.env["UPLOAD_DIR"] || path.join(process.cwd(), "uploads");
-app.use("/uploads", (_req, res, next) => {
-  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-  next();
-}, express.static(uploadsDir));
+// Serve local uploads when STORAGE_PROVIDER=local (dev). No-op in production (Cloudinary handles CDN).
+if (process.env["STORAGE_PROVIDER"] !== "cloudinary") {
+  const uploadsDir = process.env["UPLOAD_DIR"] || path.join(process.cwd(), "uploads");
+  app.use("/uploads", (_req, res, next) => {
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    next();
+  }, express.static(uploadsDir));
+}
 
 // ─── Health Check ─────────────────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {
@@ -59,20 +59,23 @@ import employeesRoutes  from "./routes/employees.routes";
 import tasksRoutes      from "./routes/tasks.routes";
 import attendanceRoutes from "./routes/attendance.routes";
 import leaveRoutes      from "./routes/leave.routes";
+import compOffRoutes    from "./routes/comp-off.routes";
 import payrollRoutes       from "./routes/payroll.routes";
 import invoicesRoutes      from "./routes/invoices.routes";
 import dashboardRoutes     from "./routes/dashboard.routes";
 import notificationsRoutes from "./routes/notifications.routes";
-import workspaceRoutes             from "./routes/workspace.routes";
 import subscriptionsRoutes         from "./routes/subscriptions.routes";
 import leadsRoutes                 from "./routes/leads.routes";
 import todoRoutes                  from "./routes/todo.routes";
-import notesRoutes                 from "./routes/notes.routes";
 import chatRoutes                  from "./routes/chat.routes";
 import settingsRoutes              from "./routes/settings.routes";
+import meRoutes                        from "./routes/me.routes";
+import fieldPermissionsRoutes          from "./routes/field-permissions.routes";
+import shiftsRoutes   from "./routes/shifts.routes";
+import holidaysRoutes from "./routes/holidays.routes";
 import { startSubscriptionExpiryJob } from "./jobs/subscription-expiry.job";
 import { startTodoReminderJob }        from "./jobs/todo-reminder.job";
-import { startNotesSnoozeJob }         from "./jobs/notes-snooze.job";
+import { startAutoAbsentJob }          from "./jobs/auto-absent.job";
 
 app.use("/api/auth",          authRoutes);
 app.use("/api/users",         usersRoutes);
@@ -81,17 +84,20 @@ app.use("/api/employees",     employeesRoutes);
 app.use("/api/tasks",         tasksRoutes);
 app.use("/api/attendance",    attendanceRoutes);
 app.use("/api/leave",         leaveRoutes);
+app.use("/api/comp-off",      compOffRoutes);
 app.use("/api/payroll",       payrollRoutes);
 app.use("/api/invoices",      invoicesRoutes);
 app.use("/api/dashboard",     dashboardRoutes);
 app.use("/api/notifications", notificationsRoutes);
-app.use("/api/workspace",     workspaceRoutes);
 app.use("/api/subscriptions", subscriptionsRoutes);
 app.use("/api/leads",         leadsRoutes);
 app.use("/api/todo",          todoRoutes);
-app.use("/api/notes",         notesRoutes);
-app.use("/api/chat",          chatRoutes);
-app.use("/api/settings",      settingsRoutes);
+app.use("/api/chat",               chatRoutes);
+app.use("/api/settings",           settingsRoutes);
+app.use("/api/me",                 meRoutes);
+app.use("/api/field-permissions",  fieldPermissionsRoutes);
+app.use("/api/shifts",             shiftsRoutes);
+app.use("/api/holidays",           holidaysRoutes);
 
 // ─── 404 Handler ──────────────────────────────────────────────────────────
 app.use((_req, res) => {
@@ -121,7 +127,7 @@ httpServer.listen(PORT, () => {
   console.log(`   Health: http://localhost:${PORT}/api/health\n`);
   startSubscriptionExpiryJob();
   startTodoReminderJob();
-  startNotesSnoozeJob();
+  startAutoAbsentJob();
 });
 
 export default app;

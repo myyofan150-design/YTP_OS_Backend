@@ -11,6 +11,7 @@ import {
   approvePayroll,
   markPayrollPaid,
   downloadPayslip,
+  deletePayrollRecord,
 } from "../controllers/payroll.controller";
 
 const router = Router();
@@ -36,6 +37,9 @@ router.patch("/:id/approve",   requireRole("SUPER_ADMIN","ADMIN","HR","ACCOUNTAN
 
 // Mark paid
 router.patch("/:id/mark-paid", requireRole("SUPER_ADMIN","ADMIN","ACCOUNTANT"), markPayrollPaid);
+
+// Delete — SUPER_ADMIN only
+router.delete("/:id",          requireRole("SUPER_ADMIN"), deletePayrollRecord);
 
 // Download payslip PDF — own-check inside controller for EMPLOYEE
 router.get("/:id/payslip",     downloadPayslip);

@@ -12,6 +12,7 @@ export const MANDATORY_DOCUMENTS: DocConfigItem[] = [
   { name: "PAN Card",                        docType: "ID_PROOF", category: "identity",  isMandatory: true },
   { name: "Bank Passbook / Cancelled Cheque", docType: "OTHER",   category: "banking",   isMandatory: true },
   { name: "Highest Education Certificate",   docType: "OTHER",    category: "education", isMandatory: true },
+  { name: "Resume",                          docType: "OTHER",    category: "other",     isMandatory: true },
 ];
 
 export const OPTIONAL_DOCUMENTS: DocConfigItem[] = [

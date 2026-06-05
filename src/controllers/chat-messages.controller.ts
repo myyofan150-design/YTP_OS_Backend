@@ -1,10 +1,8 @@
 // src/controllers/chat-messages.controller.ts
-import path from "path";
-import fs from "fs";
 import { Request, Response } from "express";
 import { q, run, RowDataPacket } from "../lib/db";
 import { canUserPostInConversation } from "../lib/chat-permissions";
-import { getRelativePath } from "../lib/storage";
+import { uploadFile } from "../lib/storage";
 import { emitToConversation } from "../lib/socket";
 
 const ADMIN_ROLES = ["SUPER_ADMIN", "ADMIN"];
@@ -204,10 +202,7 @@ async function verifyAttachmentAccess(attUuid: string, userId: number): Promise<
   return row ?? null;
 }
 
-function deleteUploadedFile(filename: string): void {
-  try { fs.unlinkSync(path.join(process.cwd(), getRelativePath("chat-attachments", filename))); }
-  catch { /* non-fatal */ }
-}
+// With memory storage the file buffer is never written to disk, so no cleanup needed on rejection.
 
 // ─── Section A: Messages ──────────────────────────────────────────────────────
 
@@ -447,26 +442,22 @@ export async function sendAttachment(req: Request, res: Response): Promise<void>
 
     const member = await getMemberRecord(uuid, userId);
     if (!member) {
-      deleteUploadedFile(req.file.filename);
       res.status(403).json({ success: false, message: "You are not a member of this conversation" });
       return;
     }
 
     if (!canUserPostInConversation(userRole, member.isAnnouncementOnly, member.memberRole)) {
-      deleteUploadedFile(req.file.filename);
       res.status(403).json({ success: false, message: "Only admins can post in announcement-only groups" });
       return;
     }
 
     if (!ALLOWED_CHAT_MIME.has(req.file.mimetype)) {
-      deleteUploadedFile(req.file.filename);
       res.status(400).json({ success: false, message: "File type not allowed. Supported: images, video, PDF, DOCX, XLSX, ZIP" });
       return;
     }
 
-    const filePath = getRelativePath("chat-attachments", req.file.filename);
-    const absPath  = path.join(process.cwd(), filePath);
-    const fileSize = fs.statSync(absPath).size;
+    const { url: filePath } = await uploadFile(req.file.buffer, { folder: "chat-attachments", filename: req.file.originalname, mimetype: req.file.mimetype });
+    const fileSize = req.file.size;
 
     const msgType: "image" | "file" = req.file.mimetype.startsWith("image/") ? "image" : "file";
     const { content, replyToId } = req.body as Record<string, string | undefined>;
@@ -656,19 +647,13 @@ export async function downloadAttachment(req: Request, res: Response): Promise<v
       return;
     }
 
-    const absPath = path.join(process.cwd(), att["filePath"]);
-    if (!fs.existsSync(absPath)) {
-      res.status(404).json({ success: false, message: "File not found on disk" });
-      return;
-    }
-
     await run(
       `UPDATE message_attachments SET download_count = download_count + 1 WHERE id = ?`,
       [att["id"]]
     );
 
     res.setHeader("Content-Disposition", `attachment; filename="${att["fileName"]}"`);
-    res.sendFile(absPath);
+    res.redirect(String(att["filePath"]));
   } catch (err) {
     console.error("[chat/downloadAttachment]", err);
     res.status(500).json({ success: false, message: "Internal server error" });
@@ -686,19 +671,13 @@ export async function downloadAttachmentByUuid(req: Request, res: Response): Pro
       return;
     }
 
-    const absPath = path.join(process.cwd(), att["filePath"]);
-    if (!fs.existsSync(absPath)) {
-      res.status(404).json({ success: false, message: "File not found on disk" });
-      return;
-    }
-
     await run(
       `UPDATE message_attachments SET download_count = download_count + 1 WHERE uuid = ?`,
       [attUuid]
     );
 
     res.setHeader("Content-Disposition", `attachment; filename="${att["fileName"]}"`);
-    res.sendFile(absPath);
+    res.redirect(String(att["filePath"]));
   } catch (err) {
     console.error("[chat/downloadAttachmentByUuid]", err);
     res.status(500).json({ success: false, message: "Internal server error" });
@@ -716,19 +695,13 @@ export async function previewAttachmentByUuid(req: Request, res: Response): Prom
       return;
     }
 
-    const absPath = path.join(process.cwd(), att["filePath"]);
-    if (!fs.existsSync(absPath)) {
-      res.status(404).json({ success: false, message: "File not found on disk" });
-      return;
-    }
-
     if (!INLINE_MIME.has(att["fileType"])) {
       res.redirect(`/api/chat/attachments/${attUuid}/download`);
       return;
     }
 
-    res.setHeader("Content-Type", att["fileType"]);
-    res.sendFile(absPath);
+    // filePath is a Cloudinary URL — redirect directly to it
+    res.redirect(String(att["filePath"]));
   } catch (err) {
     console.error("[chat/previewAttachmentByUuid]", err);
     res.status(500).json({ success: false, message: "Internal server error" });

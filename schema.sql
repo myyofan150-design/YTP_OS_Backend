@@ -153,22 +153,94 @@ CREATE TABLE IF NOT EXISTS task_attachments (
   FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS attendance_logs (
-  id INT PRIMARY KEY AUTO_INCREMENT,
-  employee_id INT NOT NULL,
-  date DATE NOT NULL,
-  clock_in DATETIME,
-  clock_out DATETIME,
-  type ENUM('PRESENT','HALF_DAY','ABSENT','LEAVE','COMP_OFF','HOLIDAY') NOT NULL DEFAULT 'PRESENT',
-  late_minutes INT NOT NULL DEFAULT 0,
-  early_out_minutes INT NOT NULL DEFAULT 0,
-  overtime_minutes INT NOT NULL DEFAULT 0,
-  work_minutes INT,
-  notes TEXT,
-  is_manual TINYINT(1) NOT NULL DEFAULT 0,
+CREATE TABLE IF NOT EXISTS shifts (
+  id            INT PRIMARY KEY AUTO_INCREMENT,
+  name          VARCHAR(100) NOT NULL,
+  start_time    TIME NOT NULL,
+  end_time      TIME NOT NULL,
+  grace_minutes INT NOT NULL DEFAULT 15,
+  break_minutes INT NOT NULL DEFAULT 60,
+  is_overnight  TINYINT(1) NOT NULL DEFAULT 0,
+  is_default    TINYINT(1) NOT NULL DEFAULT 0,
+  created_by    INT,
+  created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS holidays (
+  id         INT PRIMARY KEY AUTO_INCREMENT,
+  name       VARCHAR(200) NOT NULL,
+  date       DATE NOT NULL UNIQUE,
+  type       ENUM('NATIONAL','OPTIONAL','COMPANY') NOT NULL DEFAULT 'NATIONAL',
+  created_by INT,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS attendance_logs (
+  id                INT PRIMARY KEY AUTO_INCREMENT,
+  employee_id       INT NOT NULL,
+  date              DATE NOT NULL,
+  clock_in          DATETIME,
+  clock_out         DATETIME,
+  type              ENUM('PRESENT','HALF_DAY','ABSENT','LEAVE','COMP_OFF','HOLIDAY','WFH') NOT NULL DEFAULT 'PRESENT',
+  late_minutes      INT NOT NULL DEFAULT 0,
+  early_out_minutes INT NOT NULL DEFAULT 0,
+  overtime_minutes  INT NOT NULL DEFAULT 0,
+  work_minutes      INT,
+  notes             TEXT,
+  is_manual         TINYINT(1) NOT NULL DEFAULT 0,
+  source            ENUM('WEB','MOBILE','MANUAL','BIOMETRIC') NOT NULL DEFAULT 'WEB',
+  regularization_id INT NULL,
+  created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE KEY uq_emp_date (employee_id, date),
   FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS attendance_regularization_requests (
+  id                  INT PRIMARY KEY AUTO_INCREMENT,
+  uuid                VARCHAR(36) UNIQUE NOT NULL DEFAULT (UUID()),
+  employee_id         INT NOT NULL,
+  date                DATE NOT NULL,
+  requested_clock_in  TIME,
+  requested_clock_out TIME,
+  requested_type      ENUM('PRESENT','HALF_DAY','WFH') NOT NULL DEFAULT 'PRESENT',
+  reason              TEXT NOT NULL,
+  status              ENUM('PENDING','APPROVED','REJECTED') NOT NULL DEFAULT 'PENDING',
+  reviewed_by         INT,
+  review_note         VARCHAR(500),
+  reviewed_at         DATETIME,
+  created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE,
+  FOREIGN KEY (reviewed_by) REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS wfh_requests (
+  id          INT PRIMARY KEY AUTO_INCREMENT,
+  uuid        VARCHAR(36) UNIQUE NOT NULL DEFAULT (UUID()),
+  employee_id INT NOT NULL,
+  from_date   DATE NOT NULL,
+  to_date     DATE NOT NULL,
+  days        DECIMAL(4,1) NOT NULL DEFAULT 1,
+  reason      TEXT,
+  status      ENUM('PENDING','APPROVED','REJECTED') NOT NULL DEFAULT 'PENDING',
+  reviewed_by INT,
+  review_note VARCHAR(500),
+  reviewed_at DATETIME,
+  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE,
+  FOREIGN KEY (reviewed_by) REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS attendance_policies (
+  id          INT PRIMARY KEY AUTO_INCREMENT,
+  key_name    VARCHAR(100) UNIQUE NOT NULL,
+  value       VARCHAR(500) NOT NULL,
+  label       VARCHAR(200),
+  description TEXT,
+  updated_by  INT,
+  updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS leave_requests (
@@ -304,7 +376,19 @@ CREATE TABLE IF NOT EXISTS activity_logs (
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
 );
 
+-- Default shift
+INSERT IGNORE INTO shifts (name, start_time, end_time, grace_minutes, break_minutes, is_default)
+VALUES ('General Shift', '09:00:00', '18:00:00', 15, 60, 1);
+
+-- Default attendance policies
+INSERT IGNORE INTO attendance_policies (key_name, value, label, description) VALUES
+  ('late_deduction_per_minute', '0',   'Late Deduction Per Minute (₹)', 'Amount deducted per minute of late arrival (0 = disabled)'),
+  ('auto_absent_after_hours',   '13',  'Auto-absent After Hours',       'Hours after shift start to auto-mark absent'),
+  ('half_day_threshold_percent','50',  'Half Day Threshold (%)',         'Work % of shift below which marks as half-day'),
+  ('overtime_threshold_minutes','30',  'Overtime Threshold (min)',       'Minutes after shift end before overtime counted'),
+  ('grace_period_minutes',      '15',  'Grace Period (min)',             'Late arrival grace period before counting late minutes');
+
 -- Super Admin seed (password: Admin@123)
 INSERT IGNORE INTO users (uuid, name, email, password_hash, role, status)
-VALUES (UUID(), 'Super Admin', 'admin@agencyos.com',
+VALUES (UUID(), 'Super Admin', 'youtoopreneur@gmail.com',
   '$2b$12$CrrCBCyGhkimdlEqeS1PR.gDFYEl5A72N2ni/CuO8N1cS.wDyHfqu', 'SUPER_ADMIN', 'ACTIVE');

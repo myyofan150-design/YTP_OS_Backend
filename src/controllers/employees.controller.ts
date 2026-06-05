@@ -8,6 +8,7 @@ import { q, run, pool, RowDataPacket } from "../lib/db";
 import { encrypt, decrypt } from "../lib/encryption";
 import { logActivity } from "../lib/logger";
 import { MANDATORY_DOCUMENTS } from "../lib/employee-doc-config";
+import { uploadFile, deleteFile } from "../lib/storage";
 
 const SENSITIVE_ROLES = ["SUPER_ADMIN", "ADMIN", "HR", "ACCOUNTANT"];
 const ALLOWED_DOC_TYPES = [".pdf", ".png", ".jpg", ".jpeg", ".docx", ".xlsx"];
@@ -852,16 +853,15 @@ export async function createAgreement(req: Request, res: Response): Promise<void
     if (!req.file) { res.status(400).json({ success: false, message: "No file uploaded" }); return; }
     const body = req.body as Record<string, string>;
     if (!body["agreementType"] || !body["name"]) {
-      fs.unlinkSync(req.file.path);
       res.status(400).json({ success: false, message: "agreementType and name are required" }); return;
     }
-    const relativePath = `uploads/employee-agreements/${req.file.filename}`;
+    const { url } = await uploadFile(req.file.buffer, { folder: "employee-agreements", filename: req.file.originalname, mimetype: req.file.mimetype });
     const result = await run(
       "INSERT INTO employee_agreements (employee_id, agreement_type, name, file_path, version, signed_at, uploaded_by, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      [emp.id, body["agreementType"], body["name"], relativePath, body["version"] ?? "v1", body["signedAt"] ?? null, req.user!.id, body["notes"] ?? null]
+      [emp.id, body["agreementType"], body["name"], url, body["version"] ?? "v1", body["signedAt"] ?? null, req.user!.id, body["notes"] ?? null]
     );
     await logActivity(req.user!.id, "employee.agreement_uploaded", "EmployeeAgreement", result.insertId, undefined, { name: body["name"] }, req.ip);
-    res.status(201).json({ success: true, message: "Agreement uploaded", data: { id: result.insertId, name: body["name"], filePath: relativePath } });
+    res.status(201).json({ success: true, message: "Agreement uploaded", data: { id: result.insertId, name: body["name"], filePath: url } });
   } catch (err) {
     console.error("[employees/agreements/create]", err);
     res.status(500).json({ success: false, message: "Internal server error" });
@@ -884,7 +884,7 @@ export async function deleteAgreement(req: Request, res: Response): Promise<void
   try {
     const rows = await q<RowDataPacket>("SELECT id, file_path AS filePath FROM employee_agreements WHERE uuid = ?", [req.params["agreementUuid"] ?? ""]);
     if (!rows[0]) { res.status(404).json({ success: false, message: "Agreement not found" }); return; }
-    try { fs.unlinkSync(path.join(process.cwd(), String(rows[0]["filePath"]))); } catch { /* file gone */ }
+    await deleteFile(String(rows[0]["filePath"]));
     await run("DELETE FROM employee_agreements WHERE id = ?", [Number(rows[0]["id"])]);
     res.json({ success: true, message: "Agreement deleted", data: null });
   } catch (err) {
@@ -927,7 +927,6 @@ export async function uploadDocument(req: Request, res: Response): Promise<void>
 
     const ext = path.extname(req.file.originalname).toLowerCase();
     if (!ALLOWED_DOC_TYPES.includes(ext)) {
-      fs.unlinkSync(req.file.path);
       res.status(400).json({ success: false, message: `File type not allowed. Allowed: ${ALLOWED_DOC_TYPES.join(", ")}` }); return;
     }
     const body        = req.body as Record<string, string>;
@@ -936,14 +935,14 @@ export async function uploadDocument(req: Request, res: Response): Promise<void>
     const docCategory = body["docCategory"] || "other";
     const isMandatory = (body["isMandatory"] === "true" || body["isMandatory"] === "1") ? 1 : 0;
     const expiryDate  = body["expiryDate"]  || null;
-    const relativePath = `uploads/employee-docs/${req.file.filename}`;
+    const { url } = await uploadFile(req.file.buffer, { folder: "employee-docs", filename: req.file.originalname, mimetype: req.file.mimetype });
     const result = await run(
       "INSERT INTO employee_documents (employee_id, doc_type, name, file_path, uploaded_by, doc_category, is_mandatory, expiry_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      [rows[0]["id"], docType, docName, relativePath, req.user!.id, docCategory, isMandatory, expiryDate]
+      [rows[0]["id"], docType, docName, url, req.user!.id, docCategory, isMandatory, expiryDate]
     );
     res.status(201).json({
       success: true, message: "Document uploaded",
-      data: { id: result.insertId, name: docName, filePath: relativePath, docType, docCategory, isMandatory: !!isMandatory },
+      data: { id: result.insertId, name: docName, filePath: url, docType, docCategory, isMandatory: !!isMandatory },
     });
   } catch (err) {
     console.error("[employees/documents/upload]", err);
@@ -956,7 +955,7 @@ export async function deleteDocument(req: Request, res: Response): Promise<void>
     const docId = parseInt(String(req.params["docId"] ?? "0"), 10);
     const rows = await q<RowDataPacket>("SELECT id, file_path AS filePath FROM employee_documents WHERE id = ?", [docId]);
     if (!rows[0]) { res.status(404).json({ success: false, message: "Document not found" }); return; }
-    try { fs.unlinkSync(path.join(process.cwd(), String(rows[0]["filePath"]))); } catch { /* gone */ }
+    await deleteFile(String(rows[0]["filePath"]));
     await run("DELETE FROM employee_documents WHERE id = ?", [docId]);
     await logActivity(req.user!.id, "employee.document_deleted", "EmployeeDocument", docId, undefined, undefined, req.ip);
     res.json({ success: true, message: "Document deleted", data: null });
@@ -972,10 +971,10 @@ export async function uploadPhoto(req: Request, res: Response): Promise<void> {
     const emp = await resolveEmployee(uuid);
     if (!emp) { res.status(404).json({ success: false, message: "Employee not found" }); return; }
     if (!req.file) { res.status(400).json({ success: false, message: "No file uploaded" }); return; }
-    const relativePath = `uploads/employee-photos/${req.file.filename}`;
-    await run("UPDATE employees SET photo_url = ? WHERE id = ?", [relativePath, emp.id]);
+    const { url } = await uploadFile(req.file.buffer, { folder: "employee-photos", filename: req.file.originalname, mimetype: req.file.mimetype });
+    await run("UPDATE employees SET photo_url = ? WHERE id = ?", [url, emp.id]);
     await logActivity(req.user!.id, "employee.photo_uploaded", "Employee", emp.id, undefined, undefined, req.ip);
-    res.json({ success: true, message: "Photo uploaded", data: { photoUrl: relativePath } });
+    res.json({ success: true, message: "Photo uploaded", data: { photoUrl: url } });
   } catch (err) {
     console.error("[employees/photo]", err);
     res.status(500).json({ success: false, message: "Internal server error" });
@@ -1093,6 +1092,48 @@ export async function getLeaveBalance(req: Request, res: Response): Promise<void
     res.json({ success: true, message: "OK", data: balance });
   } catch (err) {
     console.error("[employees/leave-balance]", err);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+}
+
+export async function updateLeaveBalance(req: Request, res: Response): Promise<void> {
+  try {
+    const { uuid } = req.params as Record<string, string>;
+    const rows = await q<RowDataPacket>("SELECT id FROM employees WHERE uuid = ?", [uuid]);
+    if (!rows[0]) { res.status(404).json({ success: false, message: "Employee not found" }); return; }
+
+    const empId = Number(rows[0]["id"]);
+    const body  = req.body as Record<string, unknown>;
+
+    const casualTotal = Number(body["casualTotal"] ?? 0);
+    const sickTotal   = Number(body["sickTotal"]   ?? 0);
+    const paidTotal   = Number(body["paidTotal"]   ?? 0);
+    const compOff     = Number(body["compOff"]     ?? 0);
+
+    if ([casualTotal, sickTotal, paidTotal, compOff].some(n => isNaN(n) || n < 0)) {
+      res.status(400).json({ success: false, message: "All values must be non-negative numbers" }); return;
+    }
+
+    const year = new Date().getFullYear();
+    const existing = await q<RowDataPacket>("SELECT id FROM leave_balances WHERE employee_id = ? AND year = ?", [empId, year]);
+
+    if (existing[0]) {
+      await run(
+        "UPDATE leave_balances SET casual_total = ?, sick_total = ?, paid_total = ?, comp_off = ? WHERE employee_id = ? AND year = ?",
+        [casualTotal, sickTotal, paidTotal, compOff, empId, year]
+      );
+    } else {
+      await run(
+        "INSERT INTO leave_balances (employee_id, year, casual_total, sick_total, paid_total, comp_off) VALUES (?, ?, ?, ?, ?, ?)",
+        [empId, year, casualTotal, sickTotal, paidTotal, compOff]
+      );
+    }
+
+    const updated = await q<RowDataPacket>("SELECT * FROM leave_balances WHERE employee_id = ? AND year = ?", [empId, year]);
+    await logActivity(req.user!.id, "employee.leave_balance_updated", "Employee", empId, undefined, { casualTotal, sickTotal, paidTotal, compOff }, req.ip);
+    res.json({ success: true, message: "Leave balance updated", data: updated[0] });
+  } catch (err) {
+    console.error("[employees/leave-balance/update]", err);
     res.status(500).json({ success: false, message: "Internal server error" });
   }
 }

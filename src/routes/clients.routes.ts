@@ -13,7 +13,7 @@ import {
   listContacts, addContact, updateContact, deleteContact,
   listPayments, addPayment, deletePayment,
   updateTracking, getTimeline,
-  updateNotes,
+  updateNotes, downloadClientPdf,
 } from "../controllers/clients.controller";
 import {
   listClientMeta, createClientMeta, updateClientMeta, deleteClientMeta,
@@ -72,5 +72,8 @@ router.get("/:uuid/timeline", requireRole("SUPER_ADMIN", "ADMIN"), getTimeline);
 
 // ── Notes ─────────────────────────────────────────────────────────────────────
 router.patch("/:uuid/notes", requireRole("SUPER_ADMIN", "ADMIN", "TEAM_LEAD"), updateNotes);
+
+// ── PDF Export ────────────────────────────────────────────────────────────────
+router.get("/:uuid/pdf", downloadClientPdf);
 
 export default router;

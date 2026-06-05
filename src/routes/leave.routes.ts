@@ -6,6 +6,7 @@ import { requireRole } from "../middleware/role.middleware";
 import {
   applyLeave,
   myLeaveRequests,
+  cancelLeave,
   pendingLeaves,
   allLeaves,
   reviewLeave,
@@ -18,8 +19,9 @@ router.use(authenticate);
 const HR_ROLES = ["SUPER_ADMIN", "ADMIN", "HR"] as const;
 
 // Employee-facing
-router.post("/",           applyLeave);
-router.get("/my-requests", myLeaveRequests);
+router.post("/",                 applyLeave);
+router.get("/my-requests",       myLeaveRequests);
+router.patch("/:uuid/cancel",    cancelLeave);
 
 // HR-facing
 router.get("/pending",     requireRole(...HR_ROLES), pendingLeaves);

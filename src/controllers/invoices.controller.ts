@@ -1,11 +1,24 @@
 // src/controllers/invoices.controller.ts
 import { Request, Response } from "express";
-import path from "path";
-import fs from "fs";
+import https from "https";
+import http from "http";
 import nodemailer from "nodemailer";
 import PDFDocument from "pdfkit";
 import { q, run, pool, RowDataPacket } from "../lib/db";
 import { logActivity } from "../lib/logger";
+
+// Fetches a remote URL into a Buffer (for embedding images in PDFKit)
+function fetchUrlBuffer(url: string): Promise<Buffer | null> {
+  return new Promise((resolve) => {
+    const get = url.startsWith("https") ? https.get : http.get;
+    get(url, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => chunks.push(c));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+      res.on("error", () => resolve(null));
+    }).on("error", () => resolve(null));
+  });
+}
 
 // ─── PDF Generation ────────────────────────────────────────────────────────
 
@@ -34,19 +47,17 @@ async function generateInvoicePdf(invoice: {
   milestone?: string | null;
   client: { companyName: string; contactPerson: string; email: string | null; address: string | null; gstNumber: string | null };
   lineItems: { description: string; quantity: number; unitPrice: number; amount: number }[];
-}): Promise<string> {
-  const dir = path.join(process.cwd(), "uploads", "invoices");
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}): Promise<Buffer> {
   const fileName = `${invoice.invoiceNumber.replace(/\//g, "-")}.pdf`;
-  const filePath = path.join(dir, fileName);
-  const relativePath = `uploads/invoices/${fileName}`;
+  const company  = await getCompanySettings();
+  const logoBuffer = company.logoUrl ? await fetchUrlBuffer(company.logoUrl) : null;
 
-  const company = await getCompanySettings();
-
-  return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ size: "A4", margin: 0 });
-    const stream = fs.createWriteStream(filePath);
-    doc.pipe(stream);
+  const pdfBuffer = await new Promise<Buffer>((resolve, reject) => {
+    const doc    = new PDFDocument({ size: "A4", margin: 0 });
+    const chunks: Buffer[] = [];
+    doc.on("data", (c: Buffer) => chunks.push(c));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
 
     const pageBg  = "#DFF2EE";
     const teal    = "#2AB5A2";
@@ -65,10 +76,9 @@ async function generateInvoicePdf(invoice: {
     doc.rect(0, 0, 595, 842).fill(pageBg);
 
     // \u2500 Header (y: ~22\u201380) \u2500
-    const logoAbsPath = company.logoUrl ? path.join(process.cwd(), company.logoUrl) : null;
     let logoRendered = false;
-    if (logoAbsPath && fs.existsSync(logoAbsPath)) {
-      try { doc.image(logoAbsPath, 30, 22, { height: 44, fit: [44, 44] }); logoRendered = true; }
+    if (logoBuffer) {
+      try { doc.image(logoBuffer, 30, 22, { height: 44, fit: [44, 44] }); logoRendered = true; }
       catch { /* skip */ }
     }
     const nameX = logoRendered ? 82 : 30;
@@ -255,12 +265,12 @@ async function generateInvoicePdf(invoice: {
        );
 
     doc.end();
-    stream.on("finish", () => resolve(relativePath));
-    stream.on("error", reject);
   });
+
+  return pdfBuffer;
 }
 
-async function sendInvoiceEmail(to: string, clientName: string, invoiceNumber: string, total: number, dueDate: string, pdfPath: string) {
+async function sendInvoiceEmail(to: string, clientName: string, invoiceNumber: string, total: number, dueDate: string, pdfBuffer: Buffer) {
   if (!process.env["SMTP_HOST"]) return;
   const transporter = nodemailer.createTransport({
     host: process.env["SMTP_HOST"],
@@ -272,7 +282,7 @@ async function sendInvoiceEmail(to: string, clientName: string, invoiceNumber: s
     from: `"Agency OS" <${process.env["SMTP_FROM"] || process.env["SMTP_USER"]}>`,
     to, subject: `Invoice ${invoiceNumber} \u2014 \u20B9${total.toFixed(2)} due by ${new Date(dueDate).toLocaleDateString("en-IN")}`,
     html: `<p>Dear ${clientName},</p><p>Please find attached invoice <strong>${invoiceNumber}</strong> for <strong>\u20B9${total.toFixed(2)}</strong>.</p><p>Payment is due by <strong>${new Date(dueDate).toLocaleDateString("en-IN")}</strong>.</p><p>Regards,<br/>Agency OS Team</p>`,
-    attachments: [{ filename: `${invoiceNumber.replace(/\//g, "-")}.pdf`, path: path.join(process.cwd(), pdfPath) }],
+    attachments: [{ filename: `${invoiceNumber.replace(/\//g, "-")}.pdf`, content: pdfBuffer, contentType: "application/pdf" }],
   });
 }
 
@@ -451,7 +461,7 @@ export async function sendInvoice(req: Request, res: Response) {
     const items = await q<RowDataPacket>("SELECT description, quantity, unit_price AS unitPrice, amount FROM invoice_items WHERE invoice_id = ?", [id]);
     const r = rows[0];
 
-    const pdfPath = await generateInvoicePdf({
+    const pdfBuffer = await generateInvoicePdf({
       id, invoiceNumber: String(r["invoiceNumber"]), issueDate: r["issueDate"] as string,
       dueDate: r["dueDate"] as string, subtotal: Number(r["subtotal"]),
       gstRate: Number(r["gstRate"]), gstAmount: Number(r["gstAmount"]), total: Number(r["total"]),
@@ -461,12 +471,12 @@ export async function sendInvoice(req: Request, res: Response) {
       lineItems: items.map(i => ({ description: String(i["description"]), quantity: Number(i["quantity"]), unitPrice: Number(i["unitPrice"]), amount: Number(i["amount"]) })),
     });
 
-    await run("UPDATE invoices SET pdf_path = ?, status = 'SENT' WHERE id = ?", [pdfPath, id]);
+    await run("UPDATE invoices SET status = 'SENT' WHERE id = ?", [id]);
     if (r["clEmail"]) {
-      await sendInvoiceEmail(String(r["clEmail"]), String(r["companyName"]), String(r["invoiceNumber"]), Number(r["total"]), String(r["dueDate"]), pdfPath).catch(e => console.error("[invoices/email]", e));
+      await sendInvoiceEmail(String(r["clEmail"]), String(r["companyName"]), String(r["invoiceNumber"]), Number(r["total"]), String(r["dueDate"]), pdfBuffer).catch(e => console.error("[invoices/email]", e));
     }
     await logActivity(req.user!.id, "UPDATE", "INVOICE", id, { status: r["status"] }, { status: "SENT" }, req.ip);
-    res.json({ success: true, data: { pdfPath }, message: "Invoice sent" });
+    res.json({ success: true, data: null, message: "Invoice sent" });
   } catch (err) {
     console.error("[invoices/send]", err);
     res.status(500).json({ success: false, message: "Failed to send invoice" });
@@ -495,7 +505,6 @@ export async function deleteInvoice(req: Request, res: Response) {
     const id = Number(req.params["id"]);
     const rows = await q<RowDataPacket>("SELECT id, status FROM invoices WHERE id = ?", [id]);
     if (!rows[0]) return res.status(404).json({ success: false, message: "Invoice not found" });
-    if (rows[0]["status"] !== "DRAFT") return res.status(409).json({ success: false, message: "Only DRAFT invoices can be deleted" });
     await run("DELETE FROM invoice_items WHERE invoice_id = ?", [id]);
     await run("DELETE FROM invoices WHERE id = ?", [id]);
     await logActivity(req.user!.id, "DELETE", "INVOICE", id, rows[0], undefined, req.ip);
@@ -514,7 +523,8 @@ export async function downloadInvoicePdf(req: Request, res: Response) {
     if (!rows[0]) return res.status(404).json({ success: false, message: "Invoice not found" });
     const r = rows[0];
     const items = await q<RowDataPacket>("SELECT description, quantity, unit_price AS unitPrice, amount FROM invoice_items WHERE invoice_id = ?", [id]);
-    const pdfPath = await generateInvoicePdf({
+    const fileName  = `${String(r["invoiceNumber"]).replace(/\//g, "-")}.pdf`;
+    const pdfBuffer = await generateInvoicePdf({
       id, invoiceNumber: String(r["invoiceNumber"]), issueDate: r["issueDate"] as string,
       dueDate: r["dueDate"] as string, subtotal: Number(r["subtotal"]),
       gstRate: Number(r["gstRate"]), gstAmount: Number(r["gstAmount"]), total: Number(r["total"]),
@@ -523,12 +533,10 @@ export async function downloadInvoicePdf(req: Request, res: Response) {
       client: { companyName: String(r["companyName"]), contactPerson: String(r["contactPerson"]), email: r["clEmail"] as string | null, address: r["address"] as string | null, gstNumber: r["gstNumber"] as string | null },
       lineItems: items.map(i => ({ description: String(i["description"]), quantity: Number(i["quantity"]), unitPrice: Number(i["unitPrice"]), amount: Number(i["amount"]) })),
     });
-    await run("UPDATE invoices SET pdf_path = ? WHERE id = ?", [pdfPath, id]);
-
-    const absPath = path.join(process.cwd(), pdfPath!);
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="${String(r["invoiceNumber"]).replace(/\//g, "-")}.pdf"`);
-    fs.createReadStream(absPath).pipe(res);
+    res.setHeader("Content-Disposition", `inline; filename="${fileName}"`);
+    res.setHeader("Content-Length", pdfBuffer.length);
+    res.send(pdfBuffer);
   } catch (err) {
     console.error("[invoices/download]", err);
     res.status(500).json({ success: false, message: "Failed to download invoice" });

@@ -1,7 +1,8 @@
 // src/controllers/payroll.controller.ts
 import { Request, Response } from "express";
+import https from "https";
+import http from "http";
 import fs from "fs";
-import path from "path";
 import PDFDocument from "pdfkit";
 import { q, run, RowDataPacket } from "../lib/db";
 import { logActivity } from "../lib/logger";
@@ -61,77 +62,248 @@ async function calcPayroll(employeeId: number, month: number, year: number, base
   return { workingDays, presentDays, leaveDays, lopDays, overtimeMinutes, grossSalary, overtimeAmount, netSalary };
 }
 
+// ─── Company settings + logo fetch (shared with invoices) ──────────────────
+
+function fetchUrlBuffer(url: string): Promise<Buffer | null> {
+  return new Promise((resolve) => {
+    const get = url.startsWith("https") ? https.get : http.get;
+    get(url, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => chunks.push(c));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+      res.on("error", () => resolve(null));
+    }).on("error", () => resolve(null));
+  });
+}
+
+async function getCompanySettings(): Promise<{ name: string; tagline: string; logoUrl: string | null }> {
+  try {
+    const rows = await q<RowDataPacket>(
+      "SELECT `key`, value FROM system_settings WHERE `key` IN ('company_name','company_tagline','company_logo_url')"
+    );
+    const map: Record<string, string | null> = {};
+    rows.forEach(r => { map[String(r["key"])] = r["value"] ? String(r["value"]) : null; });
+    return {
+      name:    map["company_name"]    ?? "Agency OS",
+      tagline: map["company_tagline"] ?? "",
+      logoUrl: map["company_logo_url"] ?? null,
+    };
+  } catch {
+    return { name: "Agency OS", tagline: "", logoUrl: null };
+  }
+}
+
 // ─── PDF Payslip ───────────────────────────────────────────────────────────
 
 async function generatePayslipPdf(record: {
-  id: number; month: number; year: number;
+  id: number; month: number; year: number; status: string;
   baseSalary: number; grossSalary: number; netSalary: number;
   overtimeAmount: number; bonus: number; lateDeduction: number;
   otherDeduction: number; lopDays: number; presentDays: number; workingDays: number;
+  leaveDays: number; notes?: string | null;
   employee: { employeeCode: string; department?: string | null; designation?: string | null; user: { name: string; email: string } };
-}): Promise<string> {
-  const dir = path.join(process.cwd(), "uploads", "payslips");
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const monthName = new Date(record.year, record.month - 1).toLocaleString("en-US", { month: "long" });
-  const filename  = `${record.employee.employeeCode}-${record.month}-${record.year}.pdf`;
-  const filepath  = path.join(dir, filename);
+}): Promise<Buffer> {
+  const monthName  = new Date(record.year, record.month - 1).toLocaleString("en-US", { month: "long" });
+  const company    = await getCompanySettings();
+  const logoBuffer = company.logoUrl ? await fetchUrlBuffer(company.logoUrl) : null;
+  const fmtINR     = (n: number) => `₹${Number(n).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
 
-  return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ margin: 50, size: "A4" });
-    const out  = fs.createWriteStream(filepath);
-    doc.pipe(out);
-    const w = 495;
-    doc.fontSize(20).font("Helvetica-Bold").text("AGENCY OS", 50, 50);
-    doc.fontSize(10).font("Helvetica").fillColor("#555").text("Your Digital Growth Partner", 50, 74);
-    doc.fontSize(16).font("Helvetica-Bold").fillColor("#000").text("PAYSLIP", 400, 50, { align: "right", width: 145 });
-    doc.fontSize(10).font("Helvetica").fillColor("#555").text(`${monthName} ${record.year}`, 400, 74, { align: "right", width: 145 });
-    doc.moveTo(50, 95).lineTo(545, 95).strokeColor("#ddd").lineWidth(1).stroke();
-    doc.y = 110;
-    doc.fillColor("#000").fontSize(10).font("Helvetica-Bold").text("Employee Details", 50);
-    doc.y += 4;
-    [["Name", record.employee.user.name], ["Code", record.employee.employeeCode],
-      ["Designation", record.employee.designation ?? "—"], ["Department", record.employee.department ?? "—"],
-      ["Email", record.employee.user.email]].forEach(([k, v]) => {
-      const y = doc.y;
-      doc.font("Helvetica").fillColor("#555").text(String(k), 50, y, { width: 120 });
-      doc.fillColor("#000").text(String(v), 180, y);
-      doc.y += 2;
+  // Find a system font that supports the ₹ (U+20B9) character.
+  // PDFKit's built-in Helvetica uses WinAnsi encoding which lacks ₹.
+  const unicodeFontPairs = [
+    { r: "C:/Windows/Fonts/arial.ttf",   b: "C:/Windows/Fonts/arialbd.ttf"   },
+    { r: "C:/Windows/Fonts/segoeui.ttf", b: "C:/Windows/Fonts/segoeuib.ttf"  },
+    { r: "C:/Windows/Fonts/calibri.ttf", b: "C:/Windows/Fonts/calibrib.ttf"  },
+    { r: "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", b: "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" },
+    { r: "/usr/share/fonts/TTF/DejaVuSans.ttf",             b: "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"             },
+  ];
+  const fontPair = unicodeFontPairs.find(p => fs.existsSync(p.r) && fs.existsSync(p.b)) ?? null;
+
+  return new Promise<Buffer>((resolve, reject) => {
+    const doc    = new PDFDocument({ margin: 0, size: "A4" });
+    const chunks: Buffer[] = [];
+    doc.on("data", (c: Buffer) => chunks.push(c));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    let fontR = "Helvetica";
+    let fontB = "Helvetica-Bold";
+    if (fontPair) {
+      doc.registerFont("__R", fontPair.r);
+      doc.registerFont("__B", fontPair.b);
+      fontR = "__R";
+      fontB = "__B";
+    }
+
+    const teal   = "#0f766e";
+    const tealLt = "#99f6e4";
+    const white  = "#ffffff";
+    const sl800  = "#1e293b";
+    const sl700  = "#334155";
+    const sl500  = "#64748b";
+    const sl400  = "#94a3b8";
+    const sl50   = "#f8fafc";
+    const divClr = "#e2e8f0";
+    const red    = "#ef4444";
+    const L = 40, R = 555, W = 515;
+
+    // ── HEADER ────────────────────────────────────────────────────────────
+    doc.rect(0, 0, 595, 92).fill(teal);
+
+    let nameX = L;
+    if (logoBuffer) {
+      try {
+        doc.image(logoBuffer, L, 22, { height: 44, fit: [44, 44] });
+        nameX = L + 52;
+      } catch { /* skip */ }
+    }
+    doc.fillColor(white).fontSize(18).font(fontB)
+       .text(company.name, nameX, 27, { lineBreak: false, width: 250 });
+    if (company.tagline) {
+      doc.fillColor(tealLt).fontSize(8.5).font(fontR)
+         .text(company.tagline, nameX, 50, { lineBreak: false, width: 250 });
+    }
+
+    doc.fillColor(white).fontSize(22).font(fontB)
+       .text("PAYSLIP", 300, 21, { width: 255, align: "right", lineBreak: false });
+    doc.fillColor(tealLt).fontSize(8.5).font(fontR)
+       .text(`${monthName} ${record.year}`, 300, 48, { width: 255, align: "right", lineBreak: false });
+
+    // Status badge — outline pill
+    const badgeW = 72, badgeH = 16, badgeX = R - badgeW, badgeY = 65;
+    doc.roundedRect(badgeX, badgeY, badgeW, badgeH, 8)
+       .strokeColor(tealLt).lineWidth(0.5).stroke();
+    doc.fillColor(white).fontSize(7).font(fontB)
+       .text(record.status, badgeX, badgeY + 4.5, { width: badgeW, align: "center", lineBreak: false });
+
+    // ── EMPLOYEE / PERIOD ──────────────────────────────────────────────────
+    let y = 92;
+    const pad = 16;
+
+    doc.fillColor(sl400).fontSize(6.5).font(fontB)
+       .text("EMPLOYEE", L, y + pad, { characterSpacing: 0.8, lineBreak: false });
+    doc.fillColor(sl800).fontSize(12).font(fontB)
+       .text(record.employee.user.name, L, y + pad + 14, { lineBreak: false, width: 240 });
+    doc.fillColor(sl500).fontSize(8).font(fontR)
+       .text(record.employee.employeeCode, L, y + pad + 30, { lineBreak: false });
+    let empEndY = y + pad + 44;
+    if (record.employee.designation) {
+      doc.fillColor(sl500).fontSize(8.5).font(fontR).text(record.employee.designation, L, empEndY, { lineBreak: false });
+      empEndY += 13;
+    }
+    if (record.employee.department) {
+      doc.fillColor(sl400).fontSize(8.5).font(fontR).text(record.employee.department, L, empEndY, { lineBreak: false });
+      empEndY += 13;
+    }
+
+    doc.fillColor(sl400).fontSize(6.5).font(fontB)
+       .text("PERIOD", 310, y + pad, { width: 245, align: "right", characterSpacing: 0.8, lineBreak: false });
+    doc.fillColor(sl700).fontSize(11).font(fontB)
+       .text(`${monthName} ${record.year}`, 310, y + pad + 14, { width: 245, align: "right", lineBreak: false });
+    doc.fillColor(sl500).fontSize(8.5).font(fontR)
+       .text(`Base Salary: ${fmtINR(record.baseSalary)}`, 310, y + pad + 30, { width: 245, align: "right", lineBreak: false });
+
+    y = Math.max(empEndY, y + pad + 50) + pad;
+    doc.moveTo(L, y).lineTo(R, y).strokeColor(divClr).lineWidth(0.5).stroke();
+    y += 1;
+
+    // ── ATTENDANCE SUMMARY ────────────────────────────────────────────────
+    doc.fillColor(sl400).fontSize(6.5).font(fontB)
+       .text("ATTENDANCE SUMMARY", L, y + pad, { characterSpacing: 0.8, lineBreak: false });
+
+    const boxTop = y + pad + 14;
+    const gap    = 11;
+    const boxW   = Math.floor((W - 3 * gap) / 4);
+    const attBoxes = [
+      { label: "Working Days", value: String(record.workingDays),              red: false },
+      { label: "Present Days", value: Number(record.presentDays).toFixed(1),  red: false },
+      { label: "Leave Days",   value: Number(record.leaveDays).toFixed(1),    red: false },
+      { label: "LOP Days",     value: Number(record.lopDays).toFixed(1),      red: Number(record.lopDays) > 0 },
+    ];
+    attBoxes.forEach((b, i) => {
+      const bx = L + i * (boxW + gap);
+      doc.roundedRect(bx, boxTop, boxW, 46, 6).fill(sl50);
+      doc.fillColor(b.red ? red : sl800).fontSize(16).font(fontB)
+         .text(b.value, bx, boxTop + 7, { width: boxW, align: "center", lineBreak: false });
+      doc.fillColor(sl400).fontSize(7.5).font(fontR)
+         .text(b.label, bx, boxTop + 29, { width: boxW, align: "center", lineBreak: false });
     });
-    doc.moveTo(50, doc.y + 8).lineTo(545, doc.y + 8).strokeColor("#ddd").stroke();
-    doc.y += 20;
-    doc.font("Helvetica-Bold").fillColor("#000").text("Attendance Summary", 50);
-    doc.y += 4;
-    [["Working Days", String(record.workingDays)], ["Present Days", record.presentDays.toFixed(1)],
-      ["Leave Days", (record.grossSalary > 0 ? record.presentDays : 0).toFixed(1)],
-      ["LOP Days", record.lopDays.toFixed(1)]].forEach(([k, v]) => {
-      const y = doc.y;
-      doc.font("Helvetica").fillColor("#555").text(String(k), 50, y, { width: 120 });
-      doc.fillColor("#000").text(String(v), 180, y);
-      doc.y += 2;
+
+    y = boxTop + 46 + pad;
+    doc.moveTo(L, y).lineTo(R, y).strokeColor(divClr).lineWidth(0.5).stroke();
+    y += 1;
+
+    // ── EARNINGS & DEDUCTIONS ─────────────────────────────────────────────
+    const colMid = L + Math.floor(W / 2) + 12;
+    const halfW  = R - colMid;
+    const earnW  = colMid - L - 16;
+
+    doc.fillColor(sl400).fontSize(6.5).font(fontB)
+       .text("EARNINGS", L, y + pad, { characterSpacing: 0.8, lineBreak: false });
+    doc.fillColor(sl400).fontSize(6.5).font(fontB)
+       .text("DEDUCTIONS", colMid, y + pad, { characterSpacing: 0.8, lineBreak: false });
+
+    let earnY = y + pad + 14;
+    const earnings: [string, number][] = [
+      ["Gross Salary", record.grossSalary],
+      ...(record.overtimeAmount > 0 ? [["Overtime Pay", record.overtimeAmount] as [string, number]] : []),
+      ...(record.bonus > 0         ? [["Bonus",         record.bonus]          as [string, number]] : []),
+    ];
+    earnings.forEach(([k, v]) => {
+      doc.fillColor(sl700).fontSize(9).font(fontR)
+         .text(k, L, earnY, { lineBreak: false, width: earnW });
+      doc.fillColor(sl700).fontSize(9).font(fontB)
+         .text(fmtINR(v), L, earnY, { width: earnW, align: "right", lineBreak: false });
+      earnY += 16;
     });
-    doc.moveTo(50, doc.y + 8).lineTo(545, doc.y + 8).strokeColor("#ddd").stroke();
-    doc.y += 20;
-    const col = [50, 350, 545];
-    const tableTop = doc.y;
-    doc.font("Helvetica-Bold").text("Earnings", col[0]!, tableTop);
-    doc.font("Helvetica-Bold").text("Amount (₹)", col[1]!, tableTop);
-    doc.y = tableTop + 16;
-    ([["Base Salary", record.baseSalary], ["Overtime Pay", record.overtimeAmount], ["Bonus", record.bonus]] as [string, number][])
-      .forEach(([k, v]) => { const y = doc.y; doc.font("Helvetica").fillColor("#555").text(k, col[0]!, y); doc.fillColor("#000").text(`₹${v.toFixed(2)}`, col[1]!, y); doc.y += 2; });
-    doc.y += 10;
-    doc.font("Helvetica-Bold").fillColor("#000").text("Deductions", col[0]!);
-    doc.y += 4;
-    ([["LOP Deduction", record.lateDeduction], ["Other Deduction", record.otherDeduction]] as [string, number][])
-      .forEach(([k, v]) => { const y = doc.y; doc.font("Helvetica").fillColor("#555").text(k, col[0]!, y); doc.fillColor("#c00").text(`-₹${v.toFixed(2)}`, col[1]!, y); doc.y += 2; });
-    doc.y += 12;
-    doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor("#aaa").stroke();
-    doc.y += 8;
-    doc.font("Helvetica-Bold").fontSize(13).fillColor("#000").text("NET SALARY", 50, doc.y).text(`₹${record.netSalary.toFixed(2)}`, col[1]!, doc.y);
-    doc.y = 750;
-    doc.fontSize(8).font("Helvetica").fillColor("#999").text("This is a computer-generated payslip. No signature required.", 50, 750, { align: "center", width: w });
+
+    let dedY = y + pad + 14;
+    const deductions: [string, number][] = [
+      ...(record.lateDeduction  > 0 ? [["LOP Deduction",   record.lateDeduction]  as [string, number]] : []),
+      ...(record.otherDeduction > 0 ? [["Other Deduction", record.otherDeduction] as [string, number]] : []),
+    ];
+    if (deductions.length === 0) {
+      doc.fillColor(sl400).fontSize(9).font(fontR).text("No deductions", colMid, dedY, { lineBreak: false });
+      dedY += 16;
+    } else {
+      deductions.forEach(([k, v]) => {
+        doc.fillColor(sl700).fontSize(9).font(fontR)
+           .text(k, colMid, dedY, { lineBreak: false, width: halfW - 5 });
+        doc.fillColor(red).fontSize(9).font(fontB)
+           .text(`-${fmtINR(v)}`, colMid, dedY, { width: halfW, align: "right", lineBreak: false });
+        dedY += 16;
+      });
+    }
+
+    y = Math.max(earnY, dedY) + pad;
+    doc.moveTo(L, y).lineTo(R, y).strokeColor(divClr).lineWidth(0.5).stroke();
+    y += 1;
+
+    // ── NET SALARY ────────────────────────────────────────────────────────
+    const netBarY = y + pad;
+    doc.roundedRect(L, netBarY, W, 46, 8).fill(teal);
+    doc.fillColor(white).fontSize(12).font(fontB)
+       .text("Net Salary", L + 16, netBarY + 15, { lineBreak: false });
+    doc.fillColor(white).fontSize(18).font(fontB)
+       .text(fmtINR(record.netSalary), L, netBarY + 12, { width: W - 16, align: "right", lineBreak: false });
+    y = netBarY + 46;
+
+    // ── NOTES ─────────────────────────────────────────────────────────────
+    if (record.notes) {
+      y += pad;
+      doc.moveTo(L, y).lineTo(R, y).strokeColor(divClr).lineWidth(0.5).stroke();
+      y += pad;
+      doc.fillColor(sl400).fontSize(6.5).font(fontB)
+         .text("NOTES", L, y, { characterSpacing: 0.8, lineBreak: false });
+      doc.fillColor(sl700).fontSize(9).font(fontR)
+         .text(record.notes, L, y + 14, { width: W });
+    }
+
+    // ── FOOTER ────────────────────────────────────────────────────────────
+    doc.fillColor(sl400).fontSize(7.5).font(fontR)
+       .text("This is a computer-generated payslip. No signature required.", L, 812, { width: W, align: "center", lineBreak: false });
+
     doc.end();
-    out.on("finish", () => resolve(`uploads/payslips/${filename}`));
-    out.on("error", reject);
   });
 }
 
@@ -314,20 +486,7 @@ export async function approvePayroll(req: Request, res: Response): Promise<void>
     if (rows[0]["status"] !== "DRAFT") { res.status(409).json({ success: false, message: "Already approved" }); return; }
     const r = rows[0];
 
-    let payslipPath: string | null = null;
-    try {
-      payslipPath = await generatePayslipPdf({
-        id: Number(r["id"]), month: Number(r["month"]), year: Number(r["year"]),
-        baseSalary: Number(r["baseSalary"]), grossSalary: Number(r["grossSalary"]),
-        netSalary: Number(r["netSalary"]), overtimeAmount: Number(r["overtimeAmount"]),
-        bonus: Number(r["bonus"]), lateDeduction: Number(r["lateDeduction"]),
-        otherDeduction: Number(r["otherDeduction"]),
-        lopDays: Number(r["lopDays"]), presentDays: Number(r["presentDays"]), workingDays: Number(r["workingDays"]),
-        employee: { employeeCode: String(r["empCode"]), department: r["department"] as string | null, designation: r["designation"] as string | null, user: { name: String(r["uName"]), email: String(r["uEmail"]) } },
-      });
-    } catch (pdfErr) { console.error("[payroll/approve] PDF failed:", pdfErr); }
-
-    await run("UPDATE payroll_records SET status = 'APPROVED', payslip_path = ? WHERE id = ?", [payslipPath, id]);
+    await run("UPDATE payroll_records SET status = 'APPROVED' WHERE id = ?", [id]);
     await run(
       "INSERT INTO notifications (user_id, type, title, body, link) VALUES (?, 'PAYROLL', 'Payslip ready', ?, '/payroll')",
       [r["eUserId"], `Your payslip for ${new Date(Number(r["year"]), Number(r["month"]) - 1).toLocaleString("en-US", { month: "long" })} ${r["year"]} has been approved`]
@@ -358,10 +517,32 @@ export async function markPayrollPaid(req: Request, res: Response): Promise<void
   }
 }
 
+export async function deletePayrollRecord(req: Request, res: Response): Promise<void> {
+  try {
+    const id = parseInt(String(req.params["id"] ?? "0"), 10);
+    const rows = await q<RowDataPacket>("SELECT id, status FROM payroll_records WHERE id = ?", [id]);
+    if (!rows[0]) { res.status(404).json({ success: false, message: "Payroll record not found" }); return; }
+    await run("DELETE FROM payroll_records WHERE id = ?", [id]);
+    await logActivity(req.user!.id, "payroll.deleted", "PayrollRecord", id, { status: rows[0]["status"] }, undefined, req.ip);
+    res.json({ success: true, message: "Payroll record deleted", data: null });
+  } catch (err) {
+    console.error("[payroll/delete]", err);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+}
+
 export async function downloadPayslip(req: Request, res: Response): Promise<void> {
   try {
     const id = parseInt(String(req.params["id"] ?? "0"), 10);
-    const rows = await q<RowDataPacket>("SELECT id, employee_id AS employeeId, payslip_path AS payslipPath FROM payroll_records WHERE id = ?", [id]);
+    const rows = await q<RowDataPacket>(
+      `SELECT ${PAY_SEL}, e.employee_code AS empCode, e.department, e.designation,
+              pr.employee_id AS employeeId, u.name AS uName, u.email AS uEmail
+       FROM payroll_records pr
+       JOIN employees e ON pr.employee_id = e.id
+       JOIN users u ON e.user_id = u.id
+       WHERE pr.id = ?`,
+      [id]
+    );
     if (!rows[0]) { res.status(404).json({ success: false, message: "Not found" }); return; }
 
     if (req.user!.role === "EMPLOYEE") {
@@ -371,13 +552,32 @@ export async function downloadPayslip(req: Request, res: Response): Promise<void
       }
     }
 
-    if (!rows[0]["payslipPath"]) { res.status(404).json({ success: false, message: "Payslip not yet generated" }); return; }
-    const filepath = path.join(process.cwd(), String(rows[0]["payslipPath"]));
-    if (!fs.existsSync(filepath)) { res.status(404).json({ success: false, message: "Payslip file not found" }); return; }
+    const r = rows[0];
+    if (r["status"] === "DRAFT") { res.status(409).json({ success: false, message: "Payslip not available for DRAFT records" }); return; }
+
+    const filename  = `${r["empCode"]}-${r["month"]}-${r["year"]}.pdf`;
+    const pdfBuffer = await generatePayslipPdf({
+      id: Number(r["id"]), month: Number(r["month"]), year: Number(r["year"]),
+      status: String(r["status"]),
+      baseSalary: Number(r["baseSalary"]), grossSalary: Number(r["grossSalary"]),
+      netSalary: Number(r["netSalary"]), overtimeAmount: Number(r["overtimeAmount"]),
+      bonus: Number(r["bonus"]), lateDeduction: Number(r["lateDeduction"]),
+      otherDeduction: Number(r["otherDeduction"]),
+      lopDays: Number(r["lopDays"]), presentDays: Number(r["presentDays"]), workingDays: Number(r["workingDays"]),
+      leaveDays: Number(r["leaveDays"]),
+      notes: r["notes"] as string | null,
+      employee: {
+        employeeCode: String(r["empCode"]),
+        department:   r["department"] as string | null,
+        designation:  r["designation"] as string | null,
+        user: { name: String(r["uName"]), email: String(r["uEmail"]) },
+      },
+    });
 
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="${path.basename(filepath)}"`);
-    fs.createReadStream(filepath).pipe(res);
+    res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
+    res.setHeader("Content-Length", pdfBuffer.length);
+    res.send(pdfBuffer);
   } catch (err) {
     console.error("[payroll/payslip]", err);
     res.status(500).json({ success: false, message: "Internal server error" });

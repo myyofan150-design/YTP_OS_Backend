@@ -22,6 +22,7 @@ export interface Subscription {
   billingCycleId: number | null;
   statusId: number | null;
   price: number | null;
+  nextRenewalAmount: number | null;
   currency: string;
   autopay: boolean;
   planTier: "free" | "basic" | "trial" | "pro" | "premium" | null;

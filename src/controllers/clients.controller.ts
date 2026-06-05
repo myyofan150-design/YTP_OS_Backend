@@ -1,10 +1,337 @@
 // src/controllers/clients.controller.ts
 import { Request, Response } from "express";
+import https from "https";
+import http from "http";
 import path from "path";
-import fs from "fs";
+import PDFDocument from "pdfkit";
 import { q, run, RowDataPacket } from "../lib/db";
 import { encrypt, decrypt } from "../lib/encryption";
 import { logActivity } from "../lib/logger";
+import { uploadFile, deleteFile } from "../lib/storage";
+
+// ─── PDF helpers ──────────────────────────────────────────────────────────────
+
+function fetchUrlBuffer(url: string): Promise<Buffer | null> {
+  return new Promise((resolve) => {
+    const get = url.startsWith("https") ? https.get : http.get;
+    get(url, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => chunks.push(c));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+      res.on("error", () => resolve(null));
+    }).on("error", () => resolve(null));
+  });
+}
+
+async function getCompanySettings(): Promise<{ name: string; tagline: string; email: string; logoUrl: string | null }> {
+  try {
+    const rows = await q<RowDataPacket>(
+      "SELECT `key`, value FROM system_settings WHERE `key` IN ('company_name','company_tagline','company_email','company_logo_url')"
+    );
+    const map: Record<string, string | null> = {};
+    rows.forEach(r => { map[String(r["key"])] = r["value"] ? String(r["value"]) : null; });
+    return {
+      name:    map["company_name"]     ?? "Agency OS",
+      tagline: map["company_tagline"]  ?? "Digital Marketing Agency",
+      email:   map["company_email"]    ?? "contact@agencyos.in",
+      logoUrl: map["company_logo_url"] ?? null,
+    };
+  } catch {
+    return { name: "Agency OS", tagline: "Digital Marketing Agency", email: "contact@agencyos.in", logoUrl: null };
+  }
+}
+
+type ClientPdfData = {
+  companyName: string | null;
+  contactPerson: string;
+  email: string | null;
+  phone: string | null;
+  whatsapp: string | null;
+  website: string | null;
+  gstNumber: string | null;
+  address: string | null;
+  country: string | null;
+  city: string | null;
+  status: string;
+  contractType: string | null;
+  clientTag: string | null;
+  totalContractValue: number | null;
+  contractStart: unknown;
+  contractEnd: unknown;
+  source: string | null;
+  daysUntilRenewal: number | null;
+  onHoldReason: string | null;
+  nextFollowup: unknown;
+  meetingDatetime: unknown;
+  services: string[] | null;
+  notes: string | null;
+  logoUrl: string | null;
+  assignedUser: { name: string; email: string } | null;
+  contacts: { name: string; role: string | null; email: string | null; phone: string | null; isPrimary: boolean }[];
+  payments: { totalReceived: number; balancePending: number | null };
+};
+
+async function generateClientProfilePdf(data: ClientPdfData): Promise<Buffer> {
+  const company = await getCompanySettings();
+  const logoBuffer = company.logoUrl ? await fetchUrlBuffer(company.logoUrl) : null;
+  const clientLogoBuffer = data.logoUrl ? await fetchUrlBuffer(data.logoUrl) : null;
+
+  return new Promise<Buffer>((resolve, reject) => {
+    const doc = new PDFDocument({ size: "A4", margin: 0 });
+    const chunks: Buffer[] = [];
+    doc.on("data", (c: Buffer) => chunks.push(c));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    const pageBg      = "#DFF2EE";
+    const teal        = "#2AB5A2";
+    const dark        = "#1C1C2E";
+    const muted       = "#64748B";
+    const white       = "#FFFFFF";
+    const lightBx     = "#EEF2F5";
+    const borderColor = "#E2E8F0";
+    const PAGE_W = 595;
+    const M  = 30;
+    const CW = PAGE_W - M * 2; // 535
+
+    const fmtDate = (d: unknown): string => {
+      if (!d) return "—";
+      const clean = String(d).slice(0, 10);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(clean)) {
+        const [yr, mo, dy] = clean.split("-").map(Number);
+        return new Date(yr, mo - 1, dy).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+      }
+      const dt = new Date(String(d));
+      return isNaN(dt.getTime()) ? "—" : dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+    };
+    const fmtDatetime = (d: unknown): string => {
+      if (!d) return "—";
+      const dt = new Date(String(d));
+      return isNaN(dt.getTime()) ? "—" : dt.toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+    };
+    const fmtAmt = (n: number | null | undefined): string =>
+      n != null ? `₹${Number(n).toLocaleString("en-IN")}` : "—";
+    const str = (v: unknown): string =>
+      (v != null && v !== "") ? String(v) : "—";
+
+    // helper: draw a labeled field
+    function field(label: string, value: string, fx: number, fy: number, fw: number) {
+      doc.fillColor(muted).fontSize(6.5).font("Helvetica-Bold")
+         .text(label.toUpperCase(), fx, fy, { width: fw, lineBreak: false });
+      doc.fillColor(dark).fontSize(8.5).font("Helvetica")
+         .text(value, fx, fy + 10, { width: fw, lineBreak: false });
+    }
+
+    // helper: divider line
+    function divider(dx: number, dy: number, dw: number) {
+      doc.moveTo(dx, dy).lineTo(dx + dw, dy).strokeColor(borderColor).lineWidth(0.5).stroke();
+    }
+
+    // helper: section heading inside a white card
+    function sectionHead(label: string, hx: number, hy: number, hw: number) {
+      doc.fillColor(teal).fontSize(7.5).font("Helvetica-Bold")
+         .text(label, hx + 10, hy + 10, { lineBreak: false });
+      divider(hx + 10, hy + 21, hw - 20);
+    }
+
+    // ── Background ──
+    doc.rect(0, 0, PAGE_W, 842).fill(pageBg);
+
+    // ── Header ──
+    let agencyLogoRendered = false;
+    if (logoBuffer) {
+      try { doc.image(logoBuffer, M, 22, { height: 44, fit: [44, 44] }); agencyLogoRendered = true; }
+      catch { /* skip */ }
+    }
+    const compNameX = agencyLogoRendered ? M + 52 : M;
+    doc.fillColor(dark).fontSize(14).font("Helvetica-Bold")
+       .text(company.name, compNameX, agencyLogoRendered ? 24 : 32, { width: 230, lineBreak: false });
+    if (company.tagline) {
+      doc.fillColor(muted).fontSize(8.5).font("Helvetica")
+         .text(company.tagline, compNameX, agencyLogoRendered ? 44 : 50, { width: 230, lineBreak: false });
+    }
+    doc.fillColor(teal).fontSize(28).font("Helvetica-Bold")
+       .text("Client Profile.", 330, 20, { width: 235, align: "right", lineBreak: false });
+    doc.fillColor(muted).fontSize(8).font("Helvetica")
+       .text(`Generated: ${fmtDate(new Date())}`, 330, 57, { width: 235, align: "right", lineBreak: false });
+
+    // ── Client Identity Card ──
+    let y = 88;
+    const identH = 72;
+    doc.roundedRect(M, y, CW, identH, 10).fill(white);
+
+    // client avatar
+    let clientLogoRendered = false;
+    if (clientLogoBuffer) {
+      try { doc.image(clientLogoBuffer, M + 12, y + 12, { height: 48, fit: [48, 48] }); clientLogoRendered = true; }
+      catch { /* skip */ }
+    }
+    if (!clientLogoRendered) {
+      const initials = (data.companyName ?? data.contactPerson).slice(0, 2).toUpperCase();
+      doc.circle(M + 36, y + 36, 24).fill(teal);
+      doc.fillColor(white).fontSize(12).font("Helvetica-Bold")
+         .text(initials, M + 12, y + 30, { width: 48, align: "center", lineBreak: false });
+    }
+
+    // company name + subline
+    const infoX = M + 68;
+    const infoW = 260;
+    doc.fillColor(dark).fontSize(14).font("Helvetica-Bold")
+       .text(data.companyName ?? data.contactPerson, infoX, y + 12, { width: infoW, lineBreak: false });
+    const subLine = [data.contactPerson, data.email, data.phone].filter(Boolean).join("  ·  ");
+    doc.fillColor(muted).fontSize(7.5).font("Helvetica")
+       .text(subLine, infoX, y + 33, { width: infoW, lineBreak: false });
+
+    // status / contractType / tag badges (right-aligned)
+    const badgeY  = y + 22;
+    let badgeRX   = M + CW - 12;
+    const statusColors: Record<string, [string, string]> = {
+      ACTIVE:    ["#ECFDF5", "#059669"],
+      INACTIVE:  ["#F1F5F9", "#64748B"],
+      ON_HOLD:   ["#FFFBEB", "#D97706"],
+      COMPLETED: ["#DBEAFE", "#1D4ED8"],
+      CHURNED:   ["#FFF1F2", "#BE123C"],
+    };
+    const drawBadge = (label: string, bg: string, fg: string) => {
+      doc.fontSize(6.5).font("Helvetica-Bold");
+      const bw = Math.max(doc.widthOfString(label) + 12, 36);
+      badgeRX -= bw;
+      doc.roundedRect(badgeRX, badgeY, bw, 14, 7).fill(bg);
+      doc.fillColor(fg).text(label, badgeRX, badgeY + 4, { width: bw, align: "center", lineBreak: false });
+      badgeRX -= 5;
+    };
+    const [sBg, sFg] = statusColors[data.status] ?? ["#F1F5F9", "#64748B"];
+    drawBadge(data.status, sBg, sFg);
+    if (data.contractType) drawBadge(data.contractType, teal, white);
+    if (data.clientTag)    drawBadge(data.clientTag, lightBx, muted);
+
+    y += identH + 10;
+
+    // ── Two-column: Contact Info | Contract Details ──
+    const colGap = 10;
+    const halfW  = Math.floor((CW - colGap) / 2); // 262
+    const COL_L  = M;
+    const COL_R  = M + halfW + colGap;
+    const fHalf  = Math.floor(halfW / 2) - 14; // field half-width ≈ 117
+
+    const cardH = 145;
+    doc.roundedRect(COL_L, y, halfW, cardH, 8).fill(white);
+    doc.roundedRect(COL_R, y, halfW, cardH, 8).fill(white);
+
+    sectionHead("CONTACT INFORMATION", COL_L, y, halfW);
+    field("Contact Person", str(data.contactPerson),               COL_L + 10,         y + 28, fHalf);
+    field("Email",          str(data.email),                       COL_L + 10 + halfW/2, y + 28, fHalf);
+    field("Phone",          str(data.phone),                       COL_L + 10,         y + 54, fHalf);
+    field("GST Number",     str(data.gstNumber),                   COL_L + 10 + halfW/2, y + 54, fHalf);
+    field("Country",        str(data.country),                     COL_L + 10,         y + 80, fHalf);
+    field("City",           str(data.city),                        COL_L + 10 + halfW/2, y + 80, fHalf);
+    field("Address",        str(data.address),                     COL_L + 10,         y + 106, halfW - 20);
+    field("Website",        str(data.website),                     COL_L + 10,         y + 126, halfW - 20);
+
+    sectionHead("CONTRACT DETAILS", COL_R, y, halfW);
+    field("Contract Value", fmtAmt(data.totalContractValue),       COL_R + 10,         y + 28, fHalf);
+    field("Contract Type",  str(data.contractType),                COL_R + 10 + halfW/2, y + 28, fHalf);
+    field("Start Date",     fmtDate(data.contractStart),           COL_R + 10,         y + 54, fHalf);
+    field("End Date",       fmtDate(data.contractEnd),             COL_R + 10 + halfW/2, y + 54, fHalf);
+    field("Source",         str(data.source),                      COL_R + 10,         y + 80, fHalf);
+    field("Renewal In",     data.daysUntilRenewal != null ? `${data.daysUntilRenewal} days` : "—", COL_R + 10 + halfW/2, y + 80, fHalf);
+    field("Assigned To",    data.assignedUser ? `${data.assignedUser.name} (${data.assignedUser.email})` : "—", COL_R + 10, y + 106, halfW - 20);
+    if (data.onHoldReason) {
+      field("On Hold Reason", data.onHoldReason,                   COL_R + 10, y + 126, halfW - 20);
+    }
+
+    y += cardH + 10;
+
+    // ── Tracking ──
+    const trackH = 52;
+    doc.roundedRect(M, y, CW, trackH, 8).fill(white);
+    sectionHead("TRACKING", M, y, CW);
+    field("Next Follow-up", fmtDate(data.nextFollowup),          M + 10,          y + 28, CW / 2 - 20);
+    field("Meeting",        fmtDatetime(data.meetingDatetime),   M + 10 + CW / 2, y + 28, CW / 2 - 20);
+    y += trackH + 10;
+
+    // ── Services ──
+    const services = data.services ?? [];
+    const svcRows  = Math.max(1, Math.ceil((services.length || 1) / 6));
+    const svcH     = 30 + svcRows * 20 + 8;
+    doc.roundedRect(M, y, CW, svcH, 8).fill(white);
+    sectionHead("SERVICES", M, y, CW);
+    if (services.length === 0) {
+      doc.fillColor(muted).fontSize(8).font("Helvetica")
+         .text("No services added.", M + 10, y + 28, { lineBreak: false });
+    } else {
+      let sx = M + 10;
+      let sy = y + 27;
+      const maxX = M + CW - 10;
+      services.forEach(svc => {
+        doc.fontSize(7).font("Helvetica-Bold");
+        const tagW = doc.widthOfString(svc) + 14;
+        if (sx + tagW > maxX) { sx = M + 10; sy += 18; }
+        doc.roundedRect(sx, sy, tagW, 14, 7).fill("#EEF2FF");
+        doc.fillColor("#4338CA").text(svc, sx, sy + 4, { width: tagW, align: "center", lineBreak: false });
+        sx += tagW + 6;
+      });
+    }
+    y += svcH + 10;
+
+    // ── Payments Summary ──
+    const pyH = 52;
+    doc.roundedRect(M, y, CW, pyH, 8).fill(white);
+    sectionHead("PAYMENT SUMMARY", M, y, CW);
+    const pyCol = CW / 3;
+    field("Contract Value",  fmtAmt(data.totalContractValue),       M + 10,             y + 28, pyCol - 20);
+    field("Total Received",  fmtAmt(data.payments.totalReceived),   M + 10 + pyCol,     y + 28, pyCol - 20);
+    field("Balance Pending", data.payments.balancePending != null ? fmtAmt(data.payments.balancePending) : "—",
+                                                                     M + 10 + pyCol * 2, y + 28, pyCol - 20);
+    y += pyH + 10;
+
+    // ── Contacts Table ──
+    if (data.contacts.length > 0) {
+      const ctRows = data.contacts.slice(0, 5);
+      const ctH    = 30 + ctRows.length * 18 + 8;
+      doc.roundedRect(M, y, CW, ctH, 8).fill(white);
+      sectionHead("CONTACTS", M, y, CW);
+      const cCols = [140, 90, 190, 115];
+      let tblY = y + 27;
+      doc.fillColor(muted).fontSize(6.5).font("Helvetica-Bold");
+      doc.text("NAME",  M + 10,                               tblY, { width: cCols[0], lineBreak: false });
+      doc.text("ROLE",  M + 10 + cCols[0],                   tblY, { width: cCols[1], lineBreak: false });
+      doc.text("EMAIL", M + 10 + cCols[0] + cCols[1],        tblY, { width: cCols[2], lineBreak: false });
+      doc.text("PHONE", M + 10 + cCols[0] + cCols[1] + cCols[2], tblY, { width: cCols[3], lineBreak: false });
+      tblY += 12;
+      ctRows.forEach(contact => {
+        doc.fillColor(dark).fontSize(8).font("Helvetica");
+        doc.text(contact.isPrimary ? `★ ${contact.name}` : contact.name, M + 10, tblY, { width: cCols[0], lineBreak: false });
+        doc.text(contact.role  ?? "—", M + 10 + cCols[0],                   tblY, { width: cCols[1], lineBreak: false });
+        doc.text(contact.email ?? "—", M + 10 + cCols[0] + cCols[1],        tblY, { width: cCols[2], lineBreak: false });
+        doc.text(contact.phone ?? "—", M + 10 + cCols[0] + cCols[1] + cCols[2], tblY, { width: cCols[3], lineBreak: false });
+        tblY += 18;
+      });
+      y += ctH + 10;
+    }
+
+    // ── Notes ──
+    if (data.notes) {
+      const notesText = data.notes.length > 450 ? data.notes.slice(0, 450) + "…" : data.notes;
+      const lineEst   = Math.ceil(notesText.length / 85);
+      const notesH    = Math.max(52, 30 + lineEst * 12 + 10);
+      doc.roundedRect(M, y, CW, notesH, 8).fill(white);
+      sectionHead("NOTES", M, y, CW);
+      doc.fillColor(dark).fontSize(8.5).font("Helvetica")
+         .text(notesText, M + 10, y + 28, { width: CW - 20 });
+      y += notesH + 10;
+    }
+
+    // ── Footer ──
+    doc.fillColor(muted).fontSize(7).font("Helvetica")
+       .text(
+         "This is a computer-generated client profile report.",
+         M, 828, { width: CW, align: "center", lineBreak: false }
+       );
+
+    doc.end();
+  });
+}
 
 const ALLOWED_DOC_TYPES = [".pdf", ".png", ".jpg", ".jpeg", ".docx", ".xlsx"];
 
@@ -346,10 +673,10 @@ export async function uploadClientLogo(req: Request, res: Response): Promise<voi
     const rows = await q<RowDataPacket>("SELECT id FROM clients WHERE uuid = ?", [uuid]);
     if (!rows[0]) { res.status(404).json({ success: false, message: "Client not found" }); return; }
     if (!req.file) { res.status(400).json({ success: false, message: "No file uploaded" }); return; }
-    const relativePath = `uploads/client-logos/${req.file.filename}`;
-    await run("UPDATE clients SET logo_url = ? WHERE id = ?", [relativePath, rows[0]["id"]]);
+    const { url } = await uploadFile(req.file.buffer, { folder: "client-logos", filename: req.file.originalname, mimetype: req.file.mimetype });
+    await run("UPDATE clients SET logo_url = ? WHERE id = ?", [url, rows[0]["id"]]);
     await logActivity(req.user!.id, "client.logo_uploaded", "Client", Number(rows[0]["id"]), undefined, undefined, req.ip);
-    res.json({ success: true, message: "Logo uploaded", data: { logoUrl: relativePath } });
+    res.json({ success: true, message: "Logo uploaded", data: { logoUrl: url } });
   } catch (err) {
     console.error("[clients/logo]", err);
     res.status(500).json({ success: false, message: "Internal server error" });
@@ -418,17 +745,16 @@ export async function uploadDocument(req: Request, res: Response): Promise<void>
 
     const ext = path.extname(req.file.originalname).toLowerCase();
     if (!ALLOWED_DOC_TYPES.includes(ext)) {
-      fs.unlinkSync(req.file.path);
       res.status(400).json({ success: false, message: `File type not allowed. Allowed: ${ALLOWED_DOC_TYPES.join(", ")}` }); return;
     }
 
     const docName = (req.body as Record<string, string>)["name"] || req.file.originalname;
-    const relativePath = `uploads/client-docs/${req.file.filename}`;
+    const { url } = await uploadFile(req.file.buffer, { folder: "client-docs", filename: req.file.originalname, mimetype: req.file.mimetype });
     const result = await run(
       "INSERT INTO client_documents (client_id, name, file_path, file_type, uploaded_by) VALUES (?, ?, ?, ?, ?)",
-      [rows[0]["id"], docName, relativePath, ext.replace(".", ""), req.user!.id]
+      [rows[0]["id"], docName, url, ext.replace(".", ""), req.user!.id]
     );
-    res.status(201).json({ success: true, message: "Document uploaded", data: { id: result.insertId, name: docName, filePath: relativePath } });
+    res.status(201).json({ success: true, message: "Document uploaded", data: { id: result.insertId, name: docName, filePath: url } });
   } catch (err) {
     console.error("[clients/documents/upload]", err);
     res.status(500).json({ success: false, message: "Internal server error" });
@@ -440,7 +766,7 @@ export async function deleteDocument(req: Request, res: Response): Promise<void>
     const docId = parseInt(String(req.params["docId"] ?? "0"), 10);
     const rows = await q<RowDataPacket>("SELECT id, file_path AS filePath FROM client_documents WHERE id = ?", [docId]);
     if (!rows[0]) { res.status(404).json({ success: false, message: "Document not found" }); return; }
-    try { fs.unlinkSync(path.join(process.cwd(), String(rows[0]["filePath"]))); } catch { /* gone */ }
+    await deleteFile(String(rows[0]["filePath"]));
     await run("DELETE FROM client_documents WHERE id = ?", [docId]);
     await logActivity(req.user!.id, "client.document_deleted", "ClientDocument", docId, undefined, undefined, req.ip);
     res.json({ success: true, message: "Document deleted", data: null });
@@ -737,6 +1063,86 @@ export async function hardDeleteClient(req: Request, res: Response): Promise<voi
   } catch (err) {
     console.error("[clients/hard-delete]", err);
     res.status(500).json({ success: false, message: "Internal server error" });
+  }
+}
+
+// ─── Client PDF Export ────────────────────────────────────────────────────────
+
+export async function downloadClientPdf(req: Request, res: Response): Promise<void> {
+  try {
+    const { uuid } = req.params as Record<string, string>;
+    const rows = await q<RowDataPacket>(`SELECT ${CLIENT_SEL} FROM clients WHERE uuid = ?`, [uuid]);
+    if (!rows[0]) { res.status(404).json({ success: false, message: "Client not found" }); return; }
+    const client = rows[0];
+
+    const [contactRows, paymentRows] = await Promise.all([
+      q<RowDataPacket>(
+        `SELECT name, email, phone, role, is_primary AS isPrimary
+         FROM client_contacts WHERE client_id = ? ORDER BY is_primary DESC, created_at ASC`,
+        [client["id"]]
+      ),
+      q<RowDataPacket>(
+        "SELECT COALESCE(SUM(amount), 0) AS totalReceived FROM client_payments WHERE client_id = ?",
+        [client["id"]]
+      ),
+    ]);
+
+    let assignedUser: { name: string; email: string } | null = null;
+    if (client["assignedTo"]) {
+      const uRows = await q<RowDataPacket>("SELECT name, email FROM users WHERE id = ?", [client["assignedTo"]]);
+      if (uRows[0]) assignedUser = { name: String(uRows[0]["name"]), email: String(uRows[0]["email"]) };
+    }
+
+    const totalReceived      = Number(paymentRows[0]?.["totalReceived"] ?? 0);
+    const totalContractValue = client["totalContractValue"] != null ? Number(client["totalContractValue"]) : null;
+    const balancePending     = totalContractValue != null ? totalContractValue - totalReceived : null;
+
+    const pdfBuffer = await generateClientProfilePdf({
+      companyName:        client["companyName"] as string | null,
+      contactPerson:      String(client["contactPerson"]),
+      email:              client["email"] as string | null,
+      phone:              client["phone"] as string | null,
+      whatsapp:           client["whatsapp"] as string | null,
+      website:            client["website"] as string | null,
+      gstNumber:          client["gstNumber"] as string | null,
+      address:            client["address"] as string | null,
+      country:            client["country"] as string | null,
+      city:               client["city"] as string | null,
+      status:             String(client["status"]),
+      contractType:       client["contractType"] as string | null,
+      clientTag:          client["clientTag"] as string | null,
+      totalContractValue,
+      contractStart:      client["contractStart"],
+      contractEnd:        client["contractEnd"],
+      source:             client["source"] as string | null,
+      daysUntilRenewal:   daysUntil(client["contractEnd"]),
+      onHoldReason:       client["onHoldReason"] as string | null,
+      nextFollowup:       client["nextFollowup"],
+      meetingDatetime:    client["meetingDatetime"],
+      services:           parseServices(client["services"]),
+      notes:              client["notes"] as string | null,
+      logoUrl:            client["logoUrl"] as string | null,
+      assignedUser,
+      contacts: contactRows.map(c => ({
+        name:      String(c["name"]),
+        role:      c["role"] as string | null,
+        email:     c["email"] as string | null,
+        phone:     c["phone"] as string | null,
+        isPrimary: Boolean(c["isPrimary"]),
+      })),
+      payments: { totalReceived, balancePending },
+    });
+
+    const safeName = (String(client["companyName"] ?? client["contactPerson"] ?? "client"))
+      .replace(/[^a-zA-Z0-9]/g, "-").replace(/-+/g, "-").slice(0, 50);
+    const filename = `${safeName}-profile.pdf`;
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Length", pdfBuffer.length);
+    res.send(pdfBuffer);
+  } catch (err) {
+    console.error("[clients/pdf]", err);
+    res.status(500).json({ success: false, message: "Failed to generate client PDF" });
   }
 }
 

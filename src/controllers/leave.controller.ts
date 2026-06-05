@@ -14,14 +14,22 @@ function workingDays(from: Date, to: Date): number {
   return count;
 }
 
+// For CASUAL/SICK/PAID/EMERGENCY — fields that track used days against a total
 const LEAVE_USED_FIELD: Record<string, string> = {
-  CASUAL: "casual_used", SICK: "sick_used", PAID: "paid_used",
-  EMERGENCY: "casual_used", COMP_OFF: "comp_off",
+  CASUAL:    "casual_used",
+  SICK:      "sick_used",
+  PAID:      "paid_used",
+  EMERGENCY: "casual_used",
 };
 const LEAVE_TOTAL_FIELD: Record<string, string> = {
-  CASUAL: "casual_total", SICK: "sick_total", PAID: "paid_total",
-  EMERGENCY: "casual_total", COMP_OFF: "comp_off",
+  CASUAL:    "casual_total",
+  SICK:      "sick_total",
+  PAID:      "paid_total",
+  EMERGENCY: "casual_total",
 };
+
+// Leave types allowed for half-day requests
+const HALF_DAY_ALLOWED_TYPES = new Set(["CASUAL", "SICK", "PAID"]);
 
 async function getEmpForUser(userId: number): Promise<RowDataPacket | null> {
   const rows = await q<RowDataPacket>("SELECT * FROM employees WHERE user_id = ?", [userId]);
@@ -29,7 +37,9 @@ async function getEmpForUser(userId: number): Promise<RowDataPacket | null> {
 }
 
 const LEAVE_SEL = `lr.id, lr.uuid, lr.employee_id AS employeeId, lr.leave_type AS leaveType,
-  lr.from_date AS fromDate, lr.to_date AS toDate, lr.days, lr.reason, lr.status,
+  lr.from_date AS fromDate, lr.to_date AS toDate, lr.days,
+  lr.is_half_day AS isHalfDay, lr.half_day_slot AS halfDaySlot,
+  lr.reason, lr.status,
   lr.reviewed_by AS reviewedBy, lr.review_note AS reviewNote, lr.reviewed_at AS reviewedAt,
   lr.created_at AS createdAt`;
 
@@ -38,16 +48,32 @@ export async function applyLeave(req: Request, res: Response): Promise<void> {
     const emp = await getEmpForUser(req.user!.id);
     if (!emp) { res.status(404).json({ success: false, message: "Employee profile not found" }); return; }
 
-    const { leaveType, fromDate, toDate, reason } = req.body as Record<string, string | undefined>;
+    const { leaveType, fromDate, toDate, reason, isHalfDay, halfDaySlot } =
+      req.body as Record<string, string | boolean | undefined>;
+
     if (!leaveType || !fromDate || !toDate) {
       res.status(400).json({ success: false, message: "leaveType, fromDate and toDate are required" }); return;
     }
 
-    const from = new Date(fromDate);
-    const to   = new Date(toDate);
+    const halfDay = Boolean(isHalfDay);
+
+    if (halfDay) {
+      if (!HALF_DAY_ALLOWED_TYPES.has(String(leaveType))) {
+        res.status(400).json({ success: false, message: "Half-day leave is only allowed for CASUAL, SICK, or PAID leave" }); return;
+      }
+      if (String(fromDate) !== String(toDate)) {
+        res.status(400).json({ success: false, message: "Half-day leave must be for a single day (fromDate must equal toDate)" }); return;
+      }
+      if (!halfDaySlot || !["FIRST_HALF", "SECOND_HALF"].includes(String(halfDaySlot))) {
+        res.status(400).json({ success: false, message: "halfDaySlot must be FIRST_HALF or SECOND_HALF for half-day leave" }); return;
+      }
+    }
+
+    const from = new Date(String(fromDate));
+    const to   = new Date(String(toDate));
     if (from > to) { res.status(400).json({ success: false, message: "fromDate must be before toDate" }); return; }
 
-    const days = workingDays(from, to);
+    const days = halfDay ? 0.5 : workingDays(from, to);
     const year = from.getFullYear();
 
     // Check balance
@@ -55,32 +81,44 @@ export async function applyLeave(req: Request, res: Response): Promise<void> {
       "SELECT * FROM leave_balances WHERE employee_id = ? AND year = ?", [emp["id"], year]
     );
     if (balRows[0]) {
-      const usedField  = LEAVE_USED_FIELD[leaveType]!;
-      const totalField = LEAVE_TOTAL_FIELD[leaveType]!;
-      const used  = Number(balRows[0][usedField]  ?? 0);
-      const total = Number(balRows[0][totalField] ?? 0);
-      if (leaveType !== "COMP_OFF" && (total - used) < days) {
-        res.status(400).json({ success: false, message: `Insufficient leave balance. Remaining: ${(total - used).toFixed(1)}, Requested: ${days}` }); return;
+      if (leaveType === "COMP_OFF") {
+        const avail = Number(balRows[0]["comp_off"] ?? 0);
+        if (avail < days) {
+          res.status(400).json({ success: false, message: `Insufficient comp-off balance. Available: ${avail.toFixed(1)}, Requested: ${days}` }); return;
+        }
+      } else {
+        const usedField  = LEAVE_USED_FIELD[String(leaveType)];
+        const totalField = LEAVE_TOTAL_FIELD[String(leaveType)];
+        if (usedField && totalField) {
+          const used  = Number(balRows[0][usedField]  ?? 0);
+          const total = Number(balRows[0][totalField] ?? 0);
+          if ((total - used) < days) {
+            res.status(400).json({ success: false, message: `Insufficient leave balance. Remaining: ${(total - used).toFixed(1)}, Requested: ${days}` }); return;
+          }
+        }
       }
     }
 
     const result = await run(
-      "INSERT INTO leave_requests (employee_id, leave_type, from_date, to_date, days, reason, status) VALUES (?, ?, ?, ?, ?, ?, 'PENDING')",
-      [emp["id"], leaveType, fromDate, toDate, days, reason ?? null]
+      `INSERT INTO leave_requests
+         (employee_id, leave_type, from_date, to_date, days, is_half_day, half_day_slot, reason, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
+      [emp["id"], leaveType, fromDate, toDate, days, halfDay ? 1 : 0, halfDay ? String(halfDaySlot) : null, reason ?? null]
     );
 
     // Notify HR/ADMIN
     const hrUsers = await q<RowDataPacket>("SELECT id FROM users WHERE role IN ('HR','ADMIN','SUPER_ADMIN') AND status = 'ACTIVE'");
     const empUserRows = await q<RowDataPacket>("SELECT name FROM users WHERE id = ?", [req.user!.id]);
     const empName = empUserRows[0] ? String(empUserRows[0]["name"]) : "Employee";
+    const dayLabel = halfDay ? `half-day (${String(halfDaySlot).replace("_", " ").toLowerCase()})` : `${days} day(s)`;
     for (const u of hrUsers) {
       await run(
         "INSERT INTO notifications (user_id, type, title, body, link) VALUES (?, 'LEAVE_REQUEST', 'New leave request', ?, '/leave')",
-        [u["id"], `${empName} applied for ${days} day(s) of ${leaveType} leave`]
+        [u["id"], `${empName} applied for ${dayLabel} of ${leaveType} leave`]
       );
     }
 
-    await logActivity(req.user!.id, "leave.requested", "LeaveRequest", result.insertId, undefined, { leaveType, days }, req.ip);
+    await logActivity(req.user!.id, "leave.requested", "LeaveRequest", result.insertId, undefined, { leaveType, days, halfDay }, req.ip);
 
     const leaveRows = await q<RowDataPacket>(`SELECT ${LEAVE_SEL} FROM leave_requests lr WHERE lr.id = ?`, [result.insertId]);
     res.status(201).json({ success: true, message: "Leave request submitted", data: leaveRows[0] });
@@ -110,7 +148,8 @@ export async function pendingLeaves(_req: Request, res: Response): Promise<void>
         u.name AS uName, u.email AS uEmail, u.avatar_url AS uAvatar,
         lb.casual_total AS casualTotal, lb.casual_used AS casualUsed,
         lb.sick_total AS sickTotal, lb.sick_used AS sickUsed,
-        lb.paid_total AS paidTotal, lb.paid_used AS paidUsed
+        lb.paid_total AS paidTotal, lb.paid_used AS paidUsed,
+        lb.comp_off AS compOff
        FROM leave_requests lr
        JOIN employees e ON lr.employee_id = e.id
        JOIN users u ON e.user_id = u.id
@@ -120,11 +159,12 @@ export async function pendingLeaves(_req: Request, res: Response): Promise<void>
     );
     const data = rows.map(r => ({
       id: r["id"], uuid: r["uuid"], leaveType: r["leaveType"], fromDate: r["fromDate"],
-      toDate: r["toDate"], days: r["days"], reason: r["reason"], status: r["status"], createdAt: r["createdAt"],
+      toDate: r["toDate"], days: r["days"], isHalfDay: Boolean(r["isHalfDay"]), halfDaySlot: r["halfDaySlot"],
+      reason: r["reason"], status: r["status"], createdAt: r["createdAt"],
       employee: {
         id: r["eId"], employeeCode: r["empCode"],
         user: { id: r["eUserId"], name: r["uName"], email: r["uEmail"], avatarUrl: r["uAvatar"] },
-        leaveBalances: [{ casualTotal: r["casualTotal"], casualUsed: r["casualUsed"], sickTotal: r["sickTotal"], sickUsed: r["sickUsed"], paidTotal: r["paidTotal"], paidUsed: r["paidUsed"] }],
+        leaveBalances: [{ casualTotal: r["casualTotal"], casualUsed: r["casualUsed"], sickTotal: r["sickTotal"], sickUsed: r["sickUsed"], paidTotal: r["paidTotal"], paidUsed: r["paidUsed"], compOff: r["compOff"] }],
       },
     }));
     res.json({ success: true, message: "OK", data });
@@ -136,17 +176,22 @@ export async function pendingLeaves(_req: Request, res: Response): Promise<void>
 
 export async function allLeaves(req: Request, res: Response): Promise<void> {
   try {
-    const { status, employeeId } = req.query as Record<string, string | undefined>;
+    const { status, employeeId, leaveType, year, month, date } = req.query as Record<string, string | undefined>;
     let sql = `SELECT ${LEAVE_SEL}, e.id AS eId, e.employee_code AS empCode, u.name AS uName, u.avatar_url AS uAvatar
                FROM leave_requests lr JOIN employees e ON lr.employee_id = e.id JOIN users u ON e.user_id = u.id WHERE 1=1`;
     const p: unknown[] = [];
-    if (status)     { sql += " AND lr.status = ?";      p.push(status); }
-    if (employeeId) { sql += " AND lr.employee_id = ?"; p.push(Number(employeeId)); }
+    if (status)     { sql += " AND lr.status = ?";               p.push(status); }
+    if (employeeId) { sql += " AND lr.employee_id = ?";          p.push(Number(employeeId)); }
+    if (leaveType)  { sql += " AND lr.leave_type = ?";           p.push(leaveType); }
+    if (year)       { sql += " AND YEAR(lr.from_date) = ?";      p.push(Number(year)); }
+    if (month)      { sql += " AND MONTH(lr.from_date) = ?";     p.push(Number(month)); }
+    if (date)       { sql += " AND lr.from_date <= ? AND lr.to_date >= ?"; p.push(date); p.push(date); }
     sql += " ORDER BY lr.created_at DESC";
     const rows = await q<RowDataPacket>(sql, p as string[]);
     const data = rows.map(r => ({
       id: r["id"], uuid: r["uuid"], leaveType: r["leaveType"], fromDate: r["fromDate"],
-      toDate: r["toDate"], days: r["days"], reason: r["reason"], status: r["status"], createdAt: r["createdAt"],
+      toDate: r["toDate"], days: r["days"], isHalfDay: Boolean(r["isHalfDay"]), halfDaySlot: r["halfDaySlot"],
+      reason: r["reason"], status: r["status"], createdAt: r["createdAt"],
       employee: { id: r["eId"], employeeCode: r["empCode"], user: { name: r["uName"], avatarUrl: r["uAvatar"] } },
     }));
     res.json({ success: true, message: "OK", data });
@@ -185,26 +230,41 @@ export async function reviewLeave(req: Request, res: Response): Promise<void> {
 
       if (status === "APPROVED") {
         const year      = new Date(String(leave["from_date"])).getFullYear();
-        const usedField = LEAVE_USED_FIELD[String(leave["leave_type"])]!;
         const days      = Number(leave["days"]);
+        const leaveType = String(leave["leave_type"]);
+        const halfDay   = Boolean(leave["is_half_day"]);
+        const halfSlot  = String(leave["half_day_slot"] ?? "");
 
-        await conn.execute(
-          `UPDATE leave_balances SET ${usedField} = ${usedField} + ? WHERE employee_id = ? AND year = ?`,
-          [days, leave["employee_id"], year]
-        );
+        if (leaveType === "COMP_OFF") {
+          // Deduct from comp_off available balance
+          await conn.execute(
+            "UPDATE leave_balances SET comp_off = comp_off - ? WHERE employee_id = ? AND year = ?",
+            [days, leave["employee_id"], year]
+          );
+        } else {
+          const usedField = LEAVE_USED_FIELD[leaveType];
+          if (usedField) {
+            await conn.execute(
+              `UPDATE leave_balances SET ${usedField} = ${usedField} + ? WHERE employee_id = ? AND year = ?`,
+              [days, leave["employee_id"], year]
+            );
+          }
+        }
 
-        // Create attendance logs for each leave day
+        // Create attendance logs for leave days
         const from = new Date(String(leave["from_date"]));
         const to   = new Date(String(leave["to_date"]));
         const cur  = new Date(from); cur.setHours(0, 0, 0, 0);
         while (cur <= to) {
           if (cur.getDay() !== 0) {
-            const dateStr = cur.toISOString().split("T")[0];
+            const dateStr    = cur.toISOString().split("T")[0];
+            const attType    = halfDay ? "HALF_DAY" : "LEAVE";
+            const attNotes   = halfDay ? halfSlot : null;
             await conn.execute(
-              `INSERT INTO attendance_logs (employee_id, date, type, late_minutes)
-               VALUES (?, ?, 'LEAVE', 0)
-               ON DUPLICATE KEY UPDATE type = 'LEAVE'`,
-              [leave["employee_id"], dateStr]
+              `INSERT INTO attendance_logs (employee_id, date, type, notes, late_minutes)
+               VALUES (?, ?, ?, ?, 0)
+               ON DUPLICATE KEY UPDATE type = VALUES(type), notes = VALUES(notes)`,
+              [leave["employee_id"], dateStr, attType, attNotes]
             );
           }
           cur.setDate(cur.getDate() + 1);
@@ -243,6 +303,34 @@ export async function reviewLeave(req: Request, res: Response): Promise<void> {
   }
 }
 
+export async function cancelLeave(req: Request, res: Response): Promise<void> {
+  try {
+    const { uuid } = req.params as Record<string, string>;
+    const rows = await q<RowDataPacket>(
+      `SELECT lr.id, lr.status, lr.employee_id AS employeeId, e.user_id AS userId
+       FROM leave_requests lr JOIN employees e ON lr.employee_id = e.id
+       WHERE lr.uuid = ?`,
+      [uuid]
+    );
+    if (!rows[0]) { res.status(404).json({ success: false, message: "Leave request not found" }); return; }
+
+    if (Number(rows[0]["userId"]) !== req.user!.id) {
+      res.status(403).json({ success: false, message: "You can only cancel your own leave requests" }); return;
+    }
+    if (rows[0]["status"] !== "PENDING") {
+      res.status(409).json({ success: false, message: "Only PENDING requests can be cancelled" }); return;
+    }
+
+    await run("UPDATE leave_requests SET status = 'CANCELLED' WHERE uuid = ?", [uuid]);
+    await logActivity(req.user!.id, "leave.cancelled", "LeaveRequest", Number(rows[0]["id"]), { status: "PENDING" }, { status: "CANCELLED" }, req.ip);
+
+    res.json({ success: true, message: "Leave request cancelled", data: null });
+  } catch (err) {
+    console.error("[leave/cancel]", err);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+}
+
 export async function leaveCalendar(req: Request, res: Response): Promise<void> {
   try {
     const now   = new Date();
@@ -263,7 +351,8 @@ export async function leaveCalendar(req: Request, res: Response): Promise<void> 
     );
     const data = rows.map(r => ({
       id: r["id"], uuid: r["uuid"], leaveType: r["leaveType"], fromDate: r["fromDate"],
-      toDate: r["toDate"], days: r["days"], status: r["status"],
+      toDate: r["toDate"], days: r["days"], isHalfDay: Boolean(r["isHalfDay"]), halfDaySlot: r["halfDaySlot"],
+      status: r["status"],
       employee: { id: r["eId"], user: { id: r["uId"], name: r["uName"], avatarUrl: r["uAvatar"] } },
     }));
     res.json({ success: true, message: "OK", data });

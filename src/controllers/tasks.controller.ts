@@ -1,9 +1,8 @@
 // src/controllers/tasks.controller.ts
 import { Request, Response } from "express";
-import fs from "fs";
-import path from "path";
 import { q, run, RowDataPacket } from "../lib/db";
 import { logActivity } from "../lib/logger";
+import { uploadFile, deleteFile } from "../lib/storage";
 
 const TASK_SEL = `
   t.id, t.uuid, t.title, t.description, t.status, t.priority,
@@ -98,7 +97,7 @@ function roleWhere(userId: number, role: string): { sql: string; params: unknown
 
 export async function listTasks(req: Request, res: Response): Promise<void> {
   try {
-    const { status, priority, clientId, assignedToId, search } = req.query as Record<string, string | undefined>;
+    const { status, priority, clientId, assignedToId, search, overdue } = req.query as Record<string, string | undefined>;
     const rw = roleWhere(req.user!.id, req.user!.role);
     let sql = `SELECT ${TASK_SEL} ${TASK_JOINS} WHERE t.parent_task_id IS NULL ${rw.sql}`;
     const p: unknown[] = [...rw.params];
@@ -110,6 +109,7 @@ export async function listTasks(req: Request, res: Response): Promise<void> {
       p.push(Number(assignedToId), Number(assignedToId));
     }
     if (search)       { sql += " AND t.title LIKE ?";        p.push(`%${search}%`); }
+    if (overdue === "true") { sql += " AND t.due_date < CURDATE() AND t.status != 'DONE'"; }
     sql += " ORDER BY t.due_date ASC, t.created_at DESC";
     const rows = await q<RowDataPacket>(sql, p as string[]);
     const withMembers = await attachMembers(rows.map(mapTask));
@@ -122,6 +122,11 @@ export async function listTasks(req: Request, res: Response): Promise<void> {
 
 export async function createTask(req: Request, res: Response): Promise<void> {
   try {
+    if (req.user!.role === "EMPLOYEE") {
+      res.status(403).json({ success: false, message: "Employees cannot create tasks" });
+      return;
+    }
+
     const { title, description, status, priority, dueDate, clientId, assignedToId, memberIds } = req.body as Record<string, unknown>;
     if (!title) { res.status(400).json({ success: false, message: "title is required" }); return; }
 
@@ -405,12 +410,12 @@ export async function uploadAttachment(req: Request, res: Response): Promise<voi
     const rows = await q<RowDataPacket>("SELECT id FROM tasks WHERE uuid = ?", [uuid]);
     if (!rows[0]) { res.status(404).json({ success: false, message: "Task not found" }); return; }
     if (!req.file) { res.status(400).json({ success: false, message: "No file uploaded" }); return; }
-    const relativePath = `uploads/task-attachments/${req.file.filename}`;
+    const { url } = await uploadFile(req.file.buffer, { folder: "task-attachments", filename: req.file.originalname, mimetype: req.file.mimetype });
     const result = await run(
       "INSERT INTO task_attachments (task_id, file_path, file_name, uploaded_by) VALUES (?, ?, ?, ?)",
-      [rows[0]["id"], relativePath, req.file.originalname, req.user!.id]
+      [rows[0]["id"], url, req.file.originalname, req.user!.id]
     );
-    res.status(201).json({ success: true, message: "Attachment uploaded", data: { id: result.insertId, filePath: relativePath, fileName: req.file.originalname } });
+    res.status(201).json({ success: true, message: "Attachment uploaded", data: { id: result.insertId, filePath: url, fileName: req.file.originalname } });
   } catch (err) {
     console.error("[tasks/attachments/upload]", err);
     res.status(500).json({ success: false, message: "Internal server error" });
@@ -424,7 +429,7 @@ export async function deleteAttachment(req: Request, res: Response): Promise<voi
     if (!rows[0]) { res.status(404).json({ success: false, message: "Attachment not found" }); return; }
     const isAdmin = ["SUPER_ADMIN", "ADMIN"].includes(req.user!.role);
     if (!isAdmin && rows[0]["uploadedBy"] !== req.user!.id) { res.status(403).json({ success: false, message: "Access denied" }); return; }
-    try { fs.unlinkSync(path.join(process.cwd(), String(rows[0]["filePath"]))); } catch { /* gone */ }
+    await deleteFile(String(rows[0]["filePath"]));
     await run("DELETE FROM task_attachments WHERE id = ?", [attachId]);
     res.json({ success: true, message: "Attachment deleted", data: null });
   } catch (err) {

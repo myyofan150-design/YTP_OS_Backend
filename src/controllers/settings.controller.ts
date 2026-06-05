@@ -1,9 +1,8 @@
 // src/controllers/settings.controller.ts
 import { Request, Response } from "express";
-import path from "path";
-import fs from "fs";
 import { q, run, RowDataPacket } from "../lib/db";
 import { logActivity } from "../lib/logger";
+import { uploadFile, deleteFile } from "../lib/storage";
 
 const GENERAL_KEYS = ["company_name", "company_tagline", "company_email", "company_logo_url"] as const;
 
@@ -57,23 +56,19 @@ export async function updateGeneralSettings(req: Request, res: Response): Promis
 export async function uploadCompanyLogo(req: Request, res: Response): Promise<void> {
   try {
     if (!req.file) { res.status(400).json({ success: false, message: "No file uploaded" }); return; }
-    const relativePath = `uploads/settings/${req.file.filename}`;
 
-    // Delete old logo if it exists
+    // Delete old logo from cloud storage before uploading the new one
     const existing = await q<RowDataPacket>("SELECT value FROM system_settings WHERE `key` = 'company_logo_url'");
-    const oldPath = existing[0]?.["value"] as string | null;
-    if (oldPath) {
-      const uploadsDir = process.env["UPLOAD_DIR"] || path.join(process.cwd(), "uploads");
-      const oldFile = path.join(uploadsDir, path.basename(oldPath));
-      try { fs.unlinkSync(oldFile); } catch { /* ignore */ }
-    }
+    const oldUrl = existing[0]?.["value"] as string | null;
+    if (oldUrl) await deleteFile(oldUrl);
 
+    const { url } = await uploadFile(req.file.buffer, { folder: "settings", filename: req.file.originalname, mimetype: req.file.mimetype });
     await run(
       "INSERT INTO system_settings (`key`, value) VALUES ('company_logo_url', ?) ON DUPLICATE KEY UPDATE value = VALUES(value)",
-      [relativePath]
+      [url]
     );
-    await logActivity(req.user!.id, "settings.logo_uploaded", "SystemSettings", 0, undefined, { relativePath }, req.ip);
-    res.json({ success: true, data: { logoUrl: relativePath }, message: "Logo uploaded" });
+    await logActivity(req.user!.id, "settings.logo_uploaded", "SystemSettings", 0, undefined, { url }, req.ip);
+    res.json({ success: true, data: { logoUrl: url }, message: "Logo uploaded" });
   } catch (err) {
     console.error("[settings/logo]", err);
     res.status(500).json({ success: false, message: "Internal server error" });

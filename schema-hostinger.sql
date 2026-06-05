@@ -304,5 +304,5 @@ CREATE TABLE IF NOT EXISTS activity_logs (
 
 -- Super Admin seed (password: Admin@123)
 INSERT IGNORE INTO users (uuid, name, email, password_hash, role, status)
-VALUES (UUID(), 'Super Admin', 'admin@agencyos.com',
+VALUES (UUID(), 'Super Admin', 'youtoopreneur@gmail.com',
   '$2b$12$CrrCBCyGhkimdlEqeS1PR.gDFYEl5A72N2ni/CuO8N1cS.wDyHfqu', 'SUPER_ADMIN', 'ACTIVE');

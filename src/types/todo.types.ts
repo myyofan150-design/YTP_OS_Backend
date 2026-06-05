@@ -78,6 +78,7 @@ export interface TodoTask {
   description: string | null;
   status: "pending" | "completed";
   priority: "none" | "low" | "medium" | "high";
+  stage: "todo" | "inprogress";
   dueDate: string | null;
   dueTime: string | null;
   reminderAt: Date | string | null;

@@ -28,7 +28,7 @@ router.post("/",                requireRole(...FINANCE_ROLES), createInvoice);
 
 router.get("/:id",              requireRole(...FINANCE_ROLES), getInvoice);
 router.patch("/:id",            requireRole(...FINANCE_ROLES), updateInvoice);
-router.delete("/:id",           requireRole(...FINANCE_ROLES), deleteInvoice);
+router.delete("/:id",           requireRole("SUPER_ADMIN"), deleteInvoice);
 
 router.post("/:id/send",        requireRole(...FINANCE_ROLES), sendInvoice);
 router.patch("/:id/mark-paid",  requireRole(...FINANCE_ROLES), markInvoicePaid);

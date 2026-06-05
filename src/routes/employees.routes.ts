@@ -14,6 +14,7 @@ import {
   verifyDocument,
   getDocumentChecklist,
   getLeaveBalance,
+  updateLeaveBalance,
   exportEmployeePdf,
   getEmployeeStats,
   updatePersonal,
@@ -90,7 +91,8 @@ router.delete("/:uuid/agreements/:agreementUuid", requireRole(...HR_ROLES), dele
 router.get("/:uuid/status-history", requireRole(...HR_ROLES), getStatusHistory);
 
 // ── Leave balance ─────────────────────────────────────────────────────────────
-router.get("/:uuid/leave-balance", getLeaveBalance);
+router.get   ("/:uuid/leave-balance", getLeaveBalance);
+router.patch ("/:uuid/leave-balance", requireRole(...HR_ROLES), updateLeaveBalance);
 
 // ── PDF export ────────────────────────────────────────────────────────────────
 router.get("/:uuid/export-pdf", requireRole(...HR_ROLES), exportEmployeePdf);

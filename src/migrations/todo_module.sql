@@ -109,3 +109,28 @@ CREATE TABLE IF NOT EXISTS todo_activity (
   FOREIGN KEY (task_id) REFERENCES todo_tasks(id) ON DELETE CASCADE,
   INDEX idx_task (task_id)
 );
+
+-- Table 8: todo_task_members (multi-user task assignment)
+CREATE TABLE IF NOT EXISTS todo_task_members (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  task_id    INT NOT NULL,
+  user_id    INT NOT NULL,
+  added_by   INT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_task_user (task_id, user_id),
+  FOREIGN KEY (task_id) REFERENCES todo_tasks(id) ON DELETE CASCADE,
+  INDEX idx_user (user_id)
+);
+
+-- Table 9: todo_list_members (list sharing with multiple employees)
+CREATE TABLE IF NOT EXISTS todo_list_members (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  list_id    INT NOT NULL,
+  user_id    INT NOT NULL,
+  added_by   INT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_list_user (list_id, user_id),
+  FOREIGN KEY (list_id) REFERENCES todo_lists(id) ON DELETE CASCADE,
+  INDEX idx_user (user_id),
+  INDEX idx_list (list_id)
+);
