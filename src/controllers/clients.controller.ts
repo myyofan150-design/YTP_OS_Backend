@@ -8,6 +8,7 @@ import { q, run, RowDataPacket } from "../lib/db";
 import { encrypt, decrypt } from "../lib/encryption";
 import { logActivity } from "../lib/logger";
 import { uploadFile, deleteFile } from "../lib/storage";
+import { registerPdfFonts } from "../utils/pdfFont";
 
 // ─── PDF helpers ──────────────────────────────────────────────────────────────
 
@@ -82,6 +83,7 @@ async function generateClientProfilePdf(data: ClientPdfData): Promise<Buffer> {
     doc.on("data", (c: Buffer) => chunks.push(c));
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
+    registerPdfFonts(doc);
 
     const pageBg      = "#DFF2EE";
     const teal        = "#2AB5A2";
@@ -116,9 +118,9 @@ async function generateClientProfilePdf(data: ClientPdfData): Promise<Buffer> {
 
     // helper: draw a labeled field
     function field(label: string, value: string, fx: number, fy: number, fw: number) {
-      doc.fillColor(muted).fontSize(6.5).font("Helvetica-Bold")
+      doc.fillColor(muted).fontSize(6.5).font("B")
          .text(label.toUpperCase(), fx, fy, { width: fw, lineBreak: false });
-      doc.fillColor(dark).fontSize(8.5).font("Helvetica")
+      doc.fillColor(dark).fontSize(8.5).font("R")
          .text(value, fx, fy + 10, { width: fw, lineBreak: false });
     }
 
@@ -129,7 +131,7 @@ async function generateClientProfilePdf(data: ClientPdfData): Promise<Buffer> {
 
     // helper: section heading inside a white card
     function sectionHead(label: string, hx: number, hy: number, hw: number) {
-      doc.fillColor(teal).fontSize(7.5).font("Helvetica-Bold")
+      doc.fillColor(teal).fontSize(7.5).font("B")
          .text(label, hx + 10, hy + 10, { lineBreak: false });
       divider(hx + 10, hy + 21, hw - 20);
     }
@@ -144,15 +146,15 @@ async function generateClientProfilePdf(data: ClientPdfData): Promise<Buffer> {
       catch { /* skip */ }
     }
     const compNameX = agencyLogoRendered ? M + 52 : M;
-    doc.fillColor(dark).fontSize(14).font("Helvetica-Bold")
+    doc.fillColor(dark).fontSize(14).font("B")
        .text(company.name, compNameX, agencyLogoRendered ? 24 : 32, { width: 230, lineBreak: false });
     if (company.tagline) {
-      doc.fillColor(muted).fontSize(8.5).font("Helvetica")
+      doc.fillColor(muted).fontSize(8.5).font("R")
          .text(company.tagline, compNameX, agencyLogoRendered ? 44 : 50, { width: 230, lineBreak: false });
     }
-    doc.fillColor(teal).fontSize(28).font("Helvetica-Bold")
+    doc.fillColor(teal).fontSize(28).font("B")
        .text("Client Profile.", 330, 20, { width: 235, align: "right", lineBreak: false });
-    doc.fillColor(muted).fontSize(8).font("Helvetica")
+    doc.fillColor(muted).fontSize(8).font("R")
        .text(`Generated: ${fmtDate(new Date())}`, 330, 57, { width: 235, align: "right", lineBreak: false });
 
     // ── Client Identity Card ──
@@ -169,17 +171,17 @@ async function generateClientProfilePdf(data: ClientPdfData): Promise<Buffer> {
     if (!clientLogoRendered) {
       const initials = (data.companyName ?? data.contactPerson).slice(0, 2).toUpperCase();
       doc.circle(M + 36, y + 36, 24).fill(teal);
-      doc.fillColor(white).fontSize(12).font("Helvetica-Bold")
+      doc.fillColor(white).fontSize(12).font("B")
          .text(initials, M + 12, y + 30, { width: 48, align: "center", lineBreak: false });
     }
 
     // company name + subline
     const infoX = M + 68;
     const infoW = 260;
-    doc.fillColor(dark).fontSize(14).font("Helvetica-Bold")
+    doc.fillColor(dark).fontSize(14).font("B")
        .text(data.companyName ?? data.contactPerson, infoX, y + 12, { width: infoW, lineBreak: false });
     const subLine = [data.contactPerson, data.email, data.phone].filter(Boolean).join("  ·  ");
-    doc.fillColor(muted).fontSize(7.5).font("Helvetica")
+    doc.fillColor(muted).fontSize(7.5).font("R")
        .text(subLine, infoX, y + 33, { width: infoW, lineBreak: false });
 
     // status / contractType / tag badges (right-aligned)
@@ -193,7 +195,7 @@ async function generateClientProfilePdf(data: ClientPdfData): Promise<Buffer> {
       CHURNED:   ["#FFF1F2", "#BE123C"],
     };
     const drawBadge = (label: string, bg: string, fg: string) => {
-      doc.fontSize(6.5).font("Helvetica-Bold");
+      doc.fontSize(6.5).font("B");
       const bw = Math.max(doc.widthOfString(label) + 12, 36);
       badgeRX -= bw;
       doc.roundedRect(badgeRX, badgeY, bw, 14, 7).fill(bg);
@@ -257,14 +259,14 @@ async function generateClientProfilePdf(data: ClientPdfData): Promise<Buffer> {
     doc.roundedRect(M, y, CW, svcH, 8).fill(white);
     sectionHead("SERVICES", M, y, CW);
     if (services.length === 0) {
-      doc.fillColor(muted).fontSize(8).font("Helvetica")
+      doc.fillColor(muted).fontSize(8).font("R")
          .text("No services added.", M + 10, y + 28, { lineBreak: false });
     } else {
       let sx = M + 10;
       let sy = y + 27;
       const maxX = M + CW - 10;
       services.forEach(svc => {
-        doc.fontSize(7).font("Helvetica-Bold");
+        doc.fontSize(7).font("B");
         const tagW = doc.widthOfString(svc) + 14;
         if (sx + tagW > maxX) { sx = M + 10; sy += 18; }
         doc.roundedRect(sx, sy, tagW, 14, 7).fill("#EEF2FF");
@@ -293,14 +295,14 @@ async function generateClientProfilePdf(data: ClientPdfData): Promise<Buffer> {
       sectionHead("CONTACTS", M, y, CW);
       const cCols = [140, 90, 190, 115];
       let tblY = y + 27;
-      doc.fillColor(muted).fontSize(6.5).font("Helvetica-Bold");
+      doc.fillColor(muted).fontSize(6.5).font("B");
       doc.text("NAME",  M + 10,                               tblY, { width: cCols[0], lineBreak: false });
       doc.text("ROLE",  M + 10 + cCols[0],                   tblY, { width: cCols[1], lineBreak: false });
       doc.text("EMAIL", M + 10 + cCols[0] + cCols[1],        tblY, { width: cCols[2], lineBreak: false });
       doc.text("PHONE", M + 10 + cCols[0] + cCols[1] + cCols[2], tblY, { width: cCols[3], lineBreak: false });
       tblY += 12;
       ctRows.forEach(contact => {
-        doc.fillColor(dark).fontSize(8).font("Helvetica");
+        doc.fillColor(dark).fontSize(8).font("R");
         doc.text(contact.isPrimary ? `★ ${contact.name}` : contact.name, M + 10, tblY, { width: cCols[0], lineBreak: false });
         doc.text(contact.role  ?? "—", M + 10 + cCols[0],                   tblY, { width: cCols[1], lineBreak: false });
         doc.text(contact.email ?? "—", M + 10 + cCols[0] + cCols[1],        tblY, { width: cCols[2], lineBreak: false });
@@ -317,13 +319,13 @@ async function generateClientProfilePdf(data: ClientPdfData): Promise<Buffer> {
       const notesH    = Math.max(52, 30 + lineEst * 12 + 10);
       doc.roundedRect(M, y, CW, notesH, 8).fill(white);
       sectionHead("NOTES", M, y, CW);
-      doc.fillColor(dark).fontSize(8.5).font("Helvetica")
+      doc.fillColor(dark).fontSize(8.5).font("R")
          .text(notesText, M + 10, y + 28, { width: CW - 20 });
       y += notesH + 10;
     }
 
     // ── Footer ──
-    doc.fillColor(muted).fontSize(7).font("Helvetica")
+    doc.fillColor(muted).fontSize(7).font("R")
        .text(
          "This is a computer-generated client profile report.",
          M, 828, { width: CW, align: "center", lineBreak: false }

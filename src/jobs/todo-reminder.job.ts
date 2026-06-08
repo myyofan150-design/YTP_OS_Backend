@@ -115,12 +115,31 @@ async function runReminderCheck(): Promise<void> {
   }
 }
 
+let _dbDownSince: number | null = null;
+
 export function startTodoReminderJob(): void {
   cron.schedule("* * * * *", async () => {
     try {
       await runReminderCheck();
-    } catch (err) {
-      console.error("[TodoReminderJob] Fatal error:", err);
+      if (_dbDownSince !== null) {
+        console.log("[TodoReminderJob] DB reconnected — reminder checks resuming.");
+        _dbDownSince = null;
+      }
+    } catch (err: unknown) {
+      const isConnErr =
+        typeof err === "object" &&
+        err !== null &&
+        "code" in err &&
+        (err as { code: string }).code === "ECONNREFUSED";
+
+      if (isConnErr) {
+        if (_dbDownSince === null) {
+          _dbDownSince = Date.now();
+          console.warn("[TodoReminderJob] DB unavailable — reminder checks paused until DB is back.");
+        }
+      } else {
+        console.error("[TodoReminderJob] Fatal error:", err);
+      }
     }
   });
 

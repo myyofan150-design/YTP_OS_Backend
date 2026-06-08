@@ -10,6 +10,9 @@ import {
   updateGroup,
   deleteGroup,
   reorderGroups,
+  getGroupMembers,
+  addGroupMembers,
+  removeGroupMember,
 } from "../controllers/todo-groups.controller";
 
 import {
@@ -56,6 +59,7 @@ import {
   updateRepeat,
   // Smart views
   getSmartView,
+  getSmartCounts,
 } from "../controllers/todo-tasks.controller";
 
 const router = Router();
@@ -69,20 +73,28 @@ router.get("/health", (_req, res) => {
 router.use(authenticate);
 
 // ─── Smart Views ──────────────────────────────────────────────────────────────
-// GET /api/todo/smart/:view — today | assigned-to-me | important | completed | overdue
+// GET /api/todo/smart-counts          — counts for all smart views (nav badges)
+// GET /api/todo/smart/:view           — today | assigned-to-me | important | completed | overdue
+router.get("/smart-counts", getSmartCounts);
 router.get("/smart/:view", getSmartView);
 
 // ─── Groups ───────────────────────────────────────────────────────────────────
-// GET    /api/todo/groups          — list all groups (with list counts)
-// POST   /api/todo/groups          — create a group
-// PATCH  /api/todo/groups/reorder  — bulk sort update (static before :uuid)
-// PATCH  /api/todo/groups/:uuid    — rename / recolor a group
-// DELETE /api/todo/groups/:uuid    — delete group (lists become ungrouped)
-router.get("/groups",           listGroups);
-router.post("/groups",          createGroup);
-router.patch("/groups/reorder", reorderGroups);
-router.patch("/groups/:uuid",   updateGroup);
-router.delete("/groups/:uuid",  deleteGroup);
+// GET    /api/todo/groups                          — list own + shared groups
+// POST   /api/todo/groups                          — create a group
+// PATCH  /api/todo/groups/reorder                  — bulk sort update (static before :uuid)
+// PATCH  /api/todo/groups/:uuid                    — rename / recolor a group (creator only)
+// DELETE /api/todo/groups/:uuid                    — delete group (creator only)
+// GET    /api/todo/groups/:uuid/members            — list group members
+// POST   /api/todo/groups/:uuid/members            — add members { userIds: number[] }
+// DELETE /api/todo/groups/:uuid/members/:memberId  — remove one member
+router.get("/groups",                                listGroups);
+router.post("/groups",                               createGroup);
+router.patch("/groups/reorder",                      reorderGroups);
+router.patch("/groups/:uuid",                        updateGroup);
+router.delete("/groups/:uuid",                       deleteGroup);
+router.get("/groups/:uuid/members",                  getGroupMembers);
+router.post("/groups/:uuid/members",                 addGroupMembers);
+router.delete("/groups/:uuid/members/:memberId",     removeGroupMember);
 
 // ─── Lists ────────────────────────────────────────────────────────────────────
 // GET    /api/todo/lists               — list all lists (?groupId=uuid&isFavorite=true)

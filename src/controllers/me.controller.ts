@@ -777,10 +777,9 @@ export async function getMyTaskStats(req: Request, res: Response): Promise<void>
 
     const [open] = await q<RowDataPacket>(
       `SELECT
-         COUNT(*)                                                             AS totalOpen,
+         COUNT(*)                                                             AS assigned,
          SUM(CASE WHEN DATE(t.due_date) = CURDATE() THEN 1 ELSE 0 END)      AS todayTasks,
          SUM(CASE WHEN t.status = 'IN_PROGRESS' THEN 1 ELSE 0 END)          AS inProgress,
-         SUM(CASE WHEN t.status = 'IN_REVIEW'   THEN 1 ELSE 0 END)          AS inReview,
          SUM(CASE WHEN t.due_date < CURDATE()   THEN 1 ELSE 0 END)          AS overdue
        FROM tasks t
        WHERE (t.assigned_to_id = ? OR EXISTS (SELECT 1 FROM task_members tm WHERE tm.task_id = t.id AND tm.user_id = ?))
@@ -805,7 +804,7 @@ export async function getMyTaskStats(req: Request, res: Response): Promise<void>
         todayTasks:         Number(open['todayTasks']         ?? 0),
         completedToday:     Number(done['completedToday']     ?? 0),
         inProgress:         Number(open['inProgress']         ?? 0),
-        inReview:           Number(open['inReview']           ?? 0),
+        assigned:           Number(open['assigned']           ?? 0),
         overdue:            Number(open['overdue']            ?? 0),
         completedThisMonth: Number(done['completedThisMonth'] ?? 0),
       },

@@ -8,19 +8,23 @@ const TASK_SEL = `
   t.id, t.uuid, t.title, t.description, t.status, t.priority,
   t.due_date AS dueDate, t.client_id AS clientId, t.assigned_to_id AS assignedToId,
   t.assigned_by_id AS assignedById, t.parent_task_id AS parentTaskId,
+  t.service_id AS serviceId,
   t.created_at AS createdAt, t.updated_at AS updatedAt,
   u1.id AS atId, u1.name AS atName, COALESCE(emp_at.photo_url, u1.avatar_url) AS atAvatar,
   u2.id AS abId, u2.name AS abName,
   c.id AS clId, c.uuid AS clUuid, c.company_name AS clCompany,
+  svc.id AS svcId, svc.label AS svcLabel, svc.color AS svcColor,
   (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id = t.id) AS commentCount,
   (SELECT COUNT(*) FROM task_attachments ta WHERE ta.task_id = t.id) AS attachmentCount,
-  (SELECT COUNT(*) FROM tasks st WHERE st.parent_task_id = t.id) AS subTaskCount`;
+  (SELECT COUNT(*) FROM task_subtasks st WHERE st.task_id = t.id) AS subTaskCount,
+  (SELECT COUNT(*) FROM task_subtasks st WHERE st.task_id = t.id AND st.status = 'DONE') AS doneSubTaskCount`;
 
 const TASK_JOINS = `FROM tasks t
   LEFT JOIN users u1 ON t.assigned_to_id = u1.id
   LEFT JOIN employees emp_at ON emp_at.user_id = u1.id
   LEFT JOIN users u2 ON t.assigned_by_id = u2.id
-  LEFT JOIN clients c ON t.client_id = c.id`;
+  LEFT JOIN clients c ON t.client_id = c.id
+  LEFT JOIN client_meta_options svc ON t.service_id = svc.id AND svc.type = 'service'`;
 
 type Member = { id: number; name: string; avatarUrl?: string | null };
 
@@ -32,13 +36,16 @@ function mapTask(row: RowDataPacket) {
     assignedToId: row["assignedToId"], assignedById: row["assignedById"],
     parentTaskId: row["parentTaskId"],
     createdAt: row["createdAt"], updatedAt: row["updatedAt"],
+    serviceId:  row["serviceId"] != null ? Number(row["serviceId"]) : null,
     assignedTo: row["atId"] ? { id: row["atId"], name: row["atName"], avatarUrl: row["atAvatar"] } as Member : null,
     assignedBy: row["abId"] ? { id: row["abId"], name: row["abName"] } : null,
     client:     row["clId"] ? { id: row["clId"], uuid: row["clUuid"], companyName: row["clCompany"] } : null,
+    service:    row["svcId"] ? { id: Number(row["svcId"]), label: String(row["svcLabel"]), color: String(row["svcColor"]) } : null,
     _count: {
-      comments: Number(row["commentCount"]),
+      comments:    Number(row["commentCount"]),
       attachments: Number(row["attachmentCount"]),
-      subTasks: Number(row["subTaskCount"]),
+      subTasks:    Number(row["subTaskCount"]),
+      subTasksDone: Number(row["doneSubTaskCount"]),
     },
     members: [] as Member[],
   };
@@ -97,13 +104,14 @@ function roleWhere(userId: number, role: string): { sql: string; params: unknown
 
 export async function listTasks(req: Request, res: Response): Promise<void> {
   try {
-    const { status, priority, clientId, assignedToId, search, overdue } = req.query as Record<string, string | undefined>;
+    const { status, priority, clientId, assignedToId, search, overdue, serviceId } = req.query as Record<string, string | undefined>;
     const rw = roleWhere(req.user!.id, req.user!.role);
     let sql = `SELECT ${TASK_SEL} ${TASK_JOINS} WHERE t.parent_task_id IS NULL ${rw.sql}`;
     const p: unknown[] = [...rw.params];
     if (status)       { sql += " AND t.status = ?";          p.push(status); }
     if (priority)     { sql += " AND t.priority = ?";        p.push(priority); }
     if (clientId)     { sql += " AND t.client_id = ?";       p.push(Number(clientId)); }
+    if (serviceId)    { sql += " AND t.service_id = ?";      p.push(Number(serviceId)); }
     if (assignedToId) {
       sql += " AND (t.assigned_to_id = ? OR EXISTS (SELECT 1 FROM task_members tm WHERE tm.task_id = t.id AND tm.user_id = ?))";
       p.push(Number(assignedToId), Number(assignedToId));
@@ -127,28 +135,48 @@ export async function createTask(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const { title, description, status, priority, dueDate, clientId, assignedToId, memberIds } = req.body as Record<string, unknown>;
+    const isClientRole = req.user!.role === "CLIENT";
+
+    // For CLIENT role: auto-resolve their linked clientId and ignore body overrides
+    let resolvedClientId: number | null = null;
+    if (isClientRole) {
+      const clientRows = await q<RowDataPacket>(
+        "SELECT client_id AS clientId FROM users WHERE id = ? AND role = 'CLIENT'",
+        [req.user!.id]
+      );
+      resolvedClientId = clientRows[0]?.["clientId"] ?? null;
+      if (!resolvedClientId) {
+        res.status(403).json({ success: false, message: "No client linked to this account" });
+        return;
+      }
+    }
+
+    const { title, description, status, priority, dueDate, clientId, assignedToId, memberIds, serviceId } = req.body as Record<string, unknown>;
     if (!title) { res.status(400).json({ success: false, message: "title is required" }); return; }
 
-    // Resolve member IDs — new multi-member field takes precedence over legacy assignedToId
-    const rawMemberIds = Array.isArray(memberIds)
+    // CLIENT role: no member assignment allowed; staff roles resolve normally
+    const rawMemberIds = isClientRole
+      ? []
+      : Array.isArray(memberIds)
       ? (memberIds as unknown[]).map(Number).filter(Boolean)
       : assignedToId
       ? [Number(assignedToId)]
       : [];
 
-    const effectiveMemberIds = req.user!.role === "EMPLOYEE" ? [req.user!.id] : rawMemberIds;
+    const effectiveMemberIds = rawMemberIds;
     const primaryAssignee = effectiveMemberIds[0] ?? null;
+    const effectiveClientId  = isClientRole ? resolvedClientId : (clientId ? Number(clientId) : null);
+    const effectiveServiceId = isClientRole ? null : (serviceId ? Number(serviceId) : null);
 
     const result = await run(
-      `INSERT INTO tasks (title, description, status, priority, due_date, client_id, assigned_to_id, assigned_by_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO tasks (title, description, status, priority, due_date, client_id, assigned_to_id, assigned_by_id, service_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         String(title), description ? String(description) : null,
         status ?? "TODO", priority ?? "MEDIUM",
         dueDate ? String(dueDate) : null,
-        clientId ? Number(clientId) : null,
-        primaryAssignee, req.user!.id,
+        effectiveClientId,
+        primaryAssignee, req.user!.id, effectiveServiceId,
       ]
     );
 
@@ -195,13 +223,13 @@ export async function getTask(req: Request, res: Response): Promise<void> {
 
     // Sub-tasks
     const subRows = await q<RowDataPacket>(
-      `SELECT t.id, t.uuid, t.title, t.status, t.priority, u1.id AS atId, u1.name AS atName, COALESCE(emp_sub.photo_url, u1.avatar_url) AS atAvatar
-       FROM tasks t LEFT JOIN users u1 ON t.assigned_to_id = u1.id LEFT JOIN employees emp_sub ON emp_sub.user_id = u1.id WHERE t.parent_task_id = ?`,
+      `SELECT id, uuid, title, status, sort_order AS sortOrder, completed_at AS completedAt
+       FROM task_subtasks WHERE task_id = ? ORDER BY sort_order ASC, created_at ASC`,
       [task.id]
     );
     const subTasks = subRows.map((s) => ({
-      id: s["id"], uuid: s["uuid"], title: s["title"], status: s["status"], priority: s["priority"],
-      assignedTo: s["atId"] ? { id: s["atId"], name: s["atName"], avatarUrl: s["atAvatar"] } : null,
+      id: s["id"], uuid: s["uuid"], title: s["title"], status: s["status"],
+      sortOrder: s["sortOrder"], completedAt: s["completedAt"],
     }));
 
     // Comments
@@ -238,11 +266,26 @@ export async function getTask(req: Request, res: Response): Promise<void> {
 export async function updateTask(req: Request, res: Response): Promise<void> {
   try {
     const { uuid } = req.params as Record<string, string>;
-    const existRows = await q<RowDataPacket>("SELECT id, assigned_to_id AS assignedToId, assigned_by_id AS assignedById, status, title FROM tasks WHERE uuid = ?", [uuid]);
+    const existRows = await q<RowDataPacket>("SELECT id, client_id AS clientId, assigned_to_id AS assignedToId, assigned_by_id AS assignedById, status, title FROM tasks WHERE uuid = ?", [uuid]);
     if (!existRows[0]) { res.status(404).json({ success: false, message: "Task not found" }); return; }
     const existing = existRows[0];
 
-    if (req.user!.role === "EMPLOYEE") {
+    const isClientRole = req.user!.role === "CLIENT";
+    const isEmployee   = req.user!.role === "EMPLOYEE";
+
+    if (isClientRole) {
+      // Verify the task belongs to this client's linked client record
+      const clientRows = await q<RowDataPacket>(
+        "SELECT client_id AS clientId FROM users WHERE id = ? AND role = 'CLIENT'",
+        [req.user!.id]
+      );
+      const ownClientId = clientRows[0]?.["clientId"] ?? null;
+      if (!ownClientId || existing["clientId"] !== ownClientId) {
+        res.status(403).json({ success: false, message: "Access denied" }); return;
+      }
+    }
+
+    if (isEmployee) {
       const isPrimary = existing["assignedToId"] === req.user!.id;
       if (!isPrimary) {
         const memberCheck = await q<RowDataPacket>(
@@ -255,34 +298,36 @@ export async function updateTask(req: Request, res: Response): Promise<void> {
       }
     }
 
-    const { title, description, status, priority, dueDate, clientId, assignedToId, memberIds } = req.body as Record<string, unknown>;
-    const isEmployee = req.user!.role === "EMPLOYEE";
+    const { title, description, status, priority, dueDate, clientId, assignedToId, memberIds, serviceId } = req.body as Record<string, unknown>;
     const sets: string[] = [];
     const p: unknown[] = [];
 
     if (status != null) { sets.push("status = ?"); p.push(String(status)); }
 
-    if (!isEmployee) {
-      if (title       != null) { sets.push("title = ?");       p.push(String(title)); }
-      if (description != null) { sets.push("description = ?"); p.push(String(description)); }
-      if (priority    != null) { sets.push("priority = ?");    p.push(String(priority)); }
-      if (dueDate     != null) { sets.push("due_date = ?");    p.push(String(dueDate)); }
+    // CLIENT and EMPLOYEE can only edit safe fields; staff can edit everything
+    if (!isEmployee && !isClientRole) {
       if (clientId    != null) { sets.push("client_id = ?");   p.push(clientId ? Number(clientId) : null); }
+      if (serviceId   != null) { sets.push("service_id = ?");  p.push(serviceId ? Number(serviceId) : null); }
 
       if (memberIds != null && Array.isArray(memberIds)) {
-        // Multi-member path: sync task_members + update primary assignee
         const mids = (memberIds as unknown[]).map(Number).filter(Boolean);
         await setTaskMembers(Number(existing["id"]), mids, req.user!.id);
         sets.push("assigned_to_id = ?");
         p.push(mids[0] ?? null);
       } else if (assignedToId != null) {
-        // Legacy single-assignee path: keep backward compat
         const aid = assignedToId ? Number(assignedToId) : null;
         sets.push("assigned_to_id = ?");
         p.push(aid);
         if (aid) await setTaskMembers(Number(existing["id"]), [aid], req.user!.id);
         else await run("DELETE FROM task_members WHERE task_id = ?", [existing["id"]]);
       }
+    }
+
+    if (!isEmployee) {
+      if (title       != null) { sets.push("title = ?");       p.push(String(title)); }
+      if (description != null) { sets.push("description = ?"); p.push(String(description)); }
+      if (priority    != null) { sets.push("priority = ?");    p.push(String(priority)); }
+      if (dueDate     != null) { sets.push("due_date = ?");    p.push(String(dueDate)); }
     }
 
     if (sets.length > 0) {
@@ -434,6 +479,94 @@ export async function deleteAttachment(req: Request, res: Response): Promise<voi
     res.json({ success: true, message: "Attachment deleted", data: null });
   } catch (err) {
     console.error("[tasks/attachments/delete]", err);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+}
+
+// ── Subtask CRUD ───────────────────────────────────────────────────────────────
+
+export async function createTaskSubtask(req: Request, res: Response): Promise<void> {
+  try {
+    const { uuid } = req.params as Record<string, string>;
+    const rows = await q<RowDataPacket>("SELECT id FROM tasks WHERE uuid = ?", [uuid]);
+    if (!rows[0]) { res.status(404).json({ success: false, message: "Task not found" }); return; }
+
+    const { title } = req.body as { title?: string };
+    if (!title?.trim()) { res.status(400).json({ success: false, message: "title is required" }); return; }
+
+    const result = await run(
+      "INSERT INTO task_subtasks (task_id, title) VALUES (?, ?)",
+      [rows[0]["id"], title.trim()]
+    );
+    const sub = await q<RowDataPacket>(
+      "SELECT id, uuid, title, status, sort_order AS sortOrder, completed_at AS completedAt FROM task_subtasks WHERE id = ?",
+      [result.insertId]
+    );
+    res.status(201).json({ success: true, message: "Subtask created", data: sub[0] });
+  } catch (err) {
+    console.error("[tasks/subtasks/create]", err);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+}
+
+export async function updateTaskSubtask(req: Request, res: Response): Promise<void> {
+  try {
+    const { uuid, subUuid } = req.params as Record<string, string>;
+    const taskRows = await q<RowDataPacket>("SELECT id FROM tasks WHERE uuid = ?", [uuid]);
+    if (!taskRows[0]) { res.status(404).json({ success: false, message: "Task not found" }); return; }
+
+    const subRows = await q<RowDataPacket>(
+      "SELECT id, status FROM task_subtasks WHERE uuid = ? AND task_id = ?",
+      [subUuid, taskRows[0]["id"]]
+    );
+    if (!subRows[0]) { res.status(404).json({ success: false, message: "Subtask not found" }); return; }
+
+    const { title, status } = req.body as { title?: string; status?: string };
+    const sets: string[] = [];
+    const p: unknown[]   = [];
+
+    if (title  != null) { sets.push("title = ?");  p.push(title.trim()); }
+    if (status != null) {
+      sets.push("status = ?"); p.push(status);
+      if (status === "DONE" && subRows[0]["status"] !== "DONE") {
+        sets.push("completed_at = NOW()");
+      } else if (status === "TODO") {
+        sets.push("completed_at = NULL");
+      }
+    }
+
+    if (sets.length > 0) {
+      p.push(subRows[0]["id"]);
+      await run(`UPDATE task_subtasks SET ${sets.join(", ")} WHERE id = ?`, p);
+    }
+
+    const updated = await q<RowDataPacket>(
+      "SELECT id, uuid, title, status, sort_order AS sortOrder, completed_at AS completedAt FROM task_subtasks WHERE id = ?",
+      [subRows[0]["id"]]
+    );
+    res.json({ success: true, message: "Subtask updated", data: updated[0] });
+  } catch (err) {
+    console.error("[tasks/subtasks/update]", err);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+}
+
+export async function deleteTaskSubtask(req: Request, res: Response): Promise<void> {
+  try {
+    const { uuid, subUuid } = req.params as Record<string, string>;
+    const taskRows = await q<RowDataPacket>("SELECT id FROM tasks WHERE uuid = ?", [uuid]);
+    if (!taskRows[0]) { res.status(404).json({ success: false, message: "Task not found" }); return; }
+
+    const subRows = await q<RowDataPacket>(
+      "SELECT id FROM task_subtasks WHERE uuid = ? AND task_id = ?",
+      [subUuid, taskRows[0]["id"]]
+    );
+    if (!subRows[0]) { res.status(404).json({ success: false, message: "Subtask not found" }); return; }
+
+    await run("DELETE FROM task_subtasks WHERE id = ?", [subRows[0]["id"]]);
+    res.json({ success: true, message: "Subtask deleted", data: null });
+  } catch (err) {
+    console.error("[tasks/subtasks/delete]", err);
     res.status(500).json({ success: false, message: "Internal server error" });
   }
 }

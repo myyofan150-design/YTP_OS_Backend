@@ -9,6 +9,7 @@ import { encrypt, decrypt } from "../lib/encryption";
 import { logActivity } from "../lib/logger";
 import { MANDATORY_DOCUMENTS } from "../lib/employee-doc-config";
 import { uploadFile, deleteFile } from "../lib/storage";
+import { registerPdfFonts } from "../utils/pdfFont";
 
 const SENSITIVE_ROLES = ["SUPER_ADMIN", "ADMIN", "HR", "ACCOUNTANT"];
 const ALLOWED_DOC_TYPES = [".pdf", ".png", ".jpg", ".jpeg", ".docx", ".xlsx"];
@@ -1171,6 +1172,7 @@ export async function exportEmployeePdf(req: Request, res: Response): Promise<vo
     res.setHeader("Content-Disposition", `attachment; filename="employee-${employeeCode}-profile.pdf"`);
 
     const doc = new PDFDocument({ size: "A4", margin: 40, bufferPages: true });
+    registerPdfFonts(doc);
     doc.pipe(res);
 
     const PW = doc.page.width;
@@ -1185,24 +1187,24 @@ export async function exportEmployeePdf(req: Request, res: Response): Promise<vo
     const sectionHeader = (title: string, y: number, confidential = false): number => {
       doc.save().rect(M, y, CW, 22).fill(DARK).restore();
       const text = confidential ? `CONFIDENTIAL  ${title}` : title;
-      doc.font("Helvetica-Bold").fillColor("white").fontSize(10).text(text, M + 8, y + 6, { width: CW - 16, lineBreak: false });
+      doc.font("B").fillColor("white").fontSize(10).text(text, M + 8, y + 6, { width: CW - 16, lineBreak: false });
       return y + 28;
     };
     const field = (label: string, value: string, x: number, y: number, w: number): number => {
-      doc.font("Helvetica-Bold").fillColor(LABEL).fontSize(10).text(`${label}:`, x, y, { width: 115, lineBreak: false });
-      doc.font("Helvetica").fillColor(BODY).fontSize(10).text(String(value || "—"), x + 120, y, { width: w - 120, lineBreak: false });
+      doc.font("B").fillColor(LABEL).fontSize(10).text(`${label}:`, x, y, { width: 115, lineBreak: false });
+      doc.font("R").fillColor(BODY).fontSize(10).text(String(value || "—"), x + 120, y, { width: w - 120, lineBreak: false });
       return y + 16;
     };
     const tblHeader = (cols: string[], y: number, ws: number[]): number => {
       doc.save().rect(M, y, CW, 18).fill(THEAD).restore();
       let x = M;
-      cols.forEach((c, i) => { doc.font("Helvetica-Bold").fillColor(LABEL).fontSize(9).text(c, x + 4, y + 4, { width: (ws[i] ?? 80) - 8, lineBreak: false }); x += ws[i] ?? 80; });
+      cols.forEach((c, i) => { doc.font("B").fillColor(LABEL).fontSize(9).text(c, x + 4, y + 4, { width: (ws[i] ?? 80) - 8, lineBreak: false }); x += ws[i] ?? 80; });
       return y + 18;
     };
     const tblRow = (cells: string[], y: number, ws: number[], alt: boolean, bold = false): number => {
       if (alt) doc.save().rect(M, y, CW, 18).fill(ALT).restore();
       let x = M;
-      cells.forEach((c, i) => { doc.font(bold ? "Helvetica-Bold" : "Helvetica").fillColor(BODY).fontSize(9).text(String(c ?? "—"), x + 4, y + 4, { width: (ws[i] ?? 80) - 8, lineBreak: false }); x += ws[i] ?? 80; });
+      cells.forEach((c, i) => { doc.font(bold ? "B" : "R").fillColor(BODY).fontSize(9).text(String(c ?? "—"), x + 4, y + 4, { width: (ws[i] ?? 80) - 8, lineBreak: false }); x += ws[i] ?? 80; });
       return y + 18;
     };
     const check = (needed: number, y: number): number => {
@@ -1210,12 +1212,12 @@ export async function exportEmployeePdf(req: Request, res: Response): Promise<vo
     };
 
     let y = M;
-    doc.font("Helvetica-Bold").fillColor(DARK).fontSize(18).text("YouTooPreneur Agency OS", M, y, { width: CW * 0.65, lineBreak: false });
-    doc.font("Helvetica-Bold").fillColor(GRAY).fontSize(14).text("EMPLOYEE PROFILE", M, y + 3, { width: CW, align: "right", lineBreak: false });
+    doc.font("B").fillColor(DARK).fontSize(18).text("YouTooPreneur Agency OS", M, y, { width: CW * 0.65, lineBreak: false });
+    doc.font("B").fillColor(GRAY).fontSize(14).text("EMPLOYEE PROFILE", M, y + 3, { width: CW, align: "right", lineBreak: false });
     y += 30;
     doc.moveTo(M, y).lineTo(PW - M, y).strokeColor(RULE).lineWidth(1).stroke(); y += 8;
-    doc.font("Helvetica").fillColor(GRAY).fontSize(9).text(`Generated on: ${genDate}`, M, y, { width: CW, align: "right", lineBreak: false }); y += 13;
-    doc.font("Helvetica").fillColor(RED).fontSize(9).text("Confidential — Internal Use Only", M, y, { width: CW, align: "right", lineBreak: false }); y += 22;
+    doc.font("R").fillColor(GRAY).fontSize(9).text(`Generated on: ${genDate}`, M, y, { width: CW, align: "right", lineBreak: false }); y += 13;
+    doc.font("R").fillColor(RED).fontSize(9).text("Confidential — Internal Use Only", M, y, { width: CW, align: "right", lineBreak: false }); y += 22;
 
     y = check(130, y); y = sectionHeader("Employee Overview", y);
     const hw = CW / 2 - 8; const c1 = M; const c2 = M + CW / 2 + 8; const sY = y;
@@ -1262,7 +1264,7 @@ export async function exportEmployeePdf(req: Request, res: Response): Promise<vo
       y = field("Name",  String(row["emergencyContact"] || "—"), M, y, CW);
       y = field("Phone", String(row["emergencyPhone"]   || "—"), M, y, CW);
     } else {
-      doc.font("Helvetica").fillColor(GRAY).fontSize(10).text("No emergency contacts on file", M, y, { width: CW, lineBreak: false }); y += 16;
+      doc.font("R").fillColor(GRAY).fontSize(10).text("No emergency contacts on file", M, y, { width: CW, lineBreak: false }); y += 16;
     }
     y += 14;
 
@@ -1275,13 +1277,13 @@ export async function exportEmployeePdf(req: Request, res: Response): Promise<vo
       y = tblRow(["Paid Leave",   String(lb["paid_total"]   ?? 0), String(lb["paid_used"]   ?? 0), String(Number(lb["paid_total"]   ?? 0) - Number(lb["paid_used"]   ?? 0))], y, lw, false);
       y = tblRow(["Comp Off",     String(lb["comp_off"]     ?? 0), "0",                            String(lb["comp_off"] ?? 0)], y, lw, true);
     } else {
-      doc.font("Helvetica").fillColor(GRAY).fontSize(10).text("No leave balance data available", M + 4, y + 4, { width: CW, lineBreak: false }); y += 22;
+      doc.font("R").fillColor(GRAY).fontSize(10).text("No leave balance data available", M + 4, y + 4, { width: CW, lineBreak: false }); y += 22;
     }
     y += 14;
 
     y = check(80, y); y = sectionHeader("Documents", y);
     if (docRows.length === 0) {
-      doc.font("Helvetica").fillColor(GRAY).fontSize(10).text("No documents uploaded", M, y, { width: CW, lineBreak: false }); y += 16;
+      doc.font("R").fillColor(GRAY).fontSize(10).text("No documents uploaded", M, y, { width: CW, lineBreak: false }); y += 16;
     } else {
       const dw = [CW * 0.45, CW * 0.25, CW * 0.3];
       y = tblHeader(["Document Name", "Type", "Uploaded On"], y, dw);
@@ -1294,8 +1296,8 @@ export async function exportEmployeePdf(req: Request, res: Response): Promise<vo
       doc.switchToPage(range.start + i);
       const fy = PH - 22;
       doc.moveTo(M, fy - 8).lineTo(PW - M, fy - 8).strokeColor(RULE).lineWidth(0.5).stroke();
-      doc.font("Helvetica").fillColor(GRAY).fontSize(8).text("YouTooPreneur Agency OS — Confidential", M, fy, { width: CW / 2, lineBreak: false });
-      doc.font("Helvetica").fillColor(GRAY).fontSize(8).text(`Page ${i + 1} of ${total}`, M, fy, { width: CW, align: "right", lineBreak: false });
+      doc.font("R").fillColor(GRAY).fontSize(8).text("YouTooPreneur Agency OS — Confidential", M, fy, { width: CW / 2, lineBreak: false });
+      doc.font("R").fillColor(GRAY).fontSize(8).text(`Page ${i + 1} of ${total}`, M, fy, { width: CW, align: "right", lineBreak: false });
     }
 
     logActivity(req.user!.id, "employee.profile_exported_pdf", "Employee", Number(row["id"]), undefined, { exportedBy: req.user!.id, timestamp: new Date() }, req.ip).catch(console.error);

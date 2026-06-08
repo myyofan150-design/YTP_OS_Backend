@@ -6,6 +6,7 @@ import nodemailer from "nodemailer";
 import PDFDocument from "pdfkit";
 import { q, run, pool, RowDataPacket } from "../lib/db";
 import { logActivity } from "../lib/logger";
+import { registerPdfFonts } from "../utils/pdfFont";
 
 // Fetches a remote URL into a Buffer (for embedding images in PDFKit)
 function fetchUrlBuffer(url: string): Promise<Buffer | null> {
@@ -23,10 +24,10 @@ function fetchUrlBuffer(url: string): Promise<Buffer | null> {
 // ─── PDF Generation ────────────────────────────────────────────────────────
 
 
-async function getCompanySettings(): Promise<{ name: string; tagline: string; email: string; logoUrl: string | null }> {
+async function getCompanySettings(): Promise<{ name: string; tagline: string; email: string; phone: string | null; address: string | null; logoUrl: string | null; sealUrl: string | null }> {
   try {
     const rows = await q<RowDataPacket>(
-      "SELECT `key`, value FROM system_settings WHERE `key` IN ('company_name','company_tagline','company_email','company_logo_url')"
+      "SELECT `key`, value FROM system_settings WHERE `key` IN ('company_name','company_tagline','company_email','company_logo_url','company_phone','company_address','company_seal_url')"
     );
     const map: Record<string, string | null> = {};
     rows.forEach(r => { map[String(r["key"])] = r["value"] ? String(r["value"]) : null; });
@@ -34,14 +35,17 @@ async function getCompanySettings(): Promise<{ name: string; tagline: string; em
       name:    map["company_name"]     ?? "Agency OS",
       tagline: map["company_tagline"]  ?? "Digital Marketing Agency",
       email:   map["company_email"]    ?? "contact@agencyos.in",
+      phone:   map["company_phone"]    ?? null,
+      address: map["company_address"]  ?? null,
       logoUrl: map["company_logo_url"] ?? null,
+      sealUrl: map["company_seal_url"] ?? null,
     };
   } catch {
-    return { name: "Agency OS", tagline: "Digital Marketing Agency", email: "contact@agencyos.in", logoUrl: null };
+    return { name: "Agency OS", tagline: "Digital Marketing Agency", email: "contact@agencyos.in", phone: null, address: null, logoUrl: null, sealUrl: null };
   }
 }
 
-async function generateInvoicePdf(invoice: {
+export async function generateInvoicePdf(invoice: {
   id: number; invoiceNumber: string; issueDate: Date | string; dueDate: Date | string;
   subtotal: number; gstRate: number; gstAmount: number; total: number; notes: string | null;
   milestone?: string | null;
@@ -50,7 +54,10 @@ async function generateInvoicePdf(invoice: {
 }): Promise<Buffer> {
   const fileName = `${invoice.invoiceNumber.replace(/\//g, "-")}.pdf`;
   const company  = await getCompanySettings();
-  const logoBuffer = company.logoUrl ? await fetchUrlBuffer(company.logoUrl) : null;
+  const [logoBuffer, sealBuffer] = await Promise.all([
+    company.logoUrl ? fetchUrlBuffer(company.logoUrl) : Promise.resolve(null),
+    company.sealUrl ? fetchUrlBuffer(company.sealUrl) : Promise.resolve(null),
+  ]);
 
   const pdfBuffer = await new Promise<Buffer>((resolve, reject) => {
     const doc    = new PDFDocument({ size: "A4", margin: 0 });
@@ -58,210 +65,285 @@ async function generateInvoicePdf(invoice: {
     doc.on("data", (c: Buffer) => chunks.push(c));
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
+    registerPdfFonts(doc);
 
-    const pageBg  = "#DFF2EE";
     const teal    = "#2AB5A2";
     const dark    = "#1C1C2E";
     const muted   = "#64748B";
     const white   = "#FFFFFF";
-    const lightBx = "#EEF2F5";
-    const altRow  = "#F1F5F9";
+    const lightBg = "#F5F7F8";
+    const altRow  = "#F8F9FA";
+    const borderC = "#E2E8F0";
+
+    const W = 595, H = 842;
+    const ML = 40;
+    const CW = W - ML * 2; // 515
 
     const fmtDate = (d: Date | string) =>
       (d instanceof Date ? d : new Date(String(d)))
-        .toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+        .toLocaleDateString("en-IN", { day: "2-digit", month: "2-digit", year: "numeric" });
     const fmtAmt = (n: number) => `\u20B9${n.toFixed(2)}`;
 
-    // \u2500 Page background \u2500
-    doc.rect(0, 0, 595, 842).fill(pageBg);
+    // White background
+    doc.rect(0, 0, W, H).fill(white);
 
-    // \u2500 Header (y: ~22\u201380) \u2500
-    let logoRendered = false;
+    // \u2500\u2500 Header \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    let y = 35;
     if (logoBuffer) {
-      try { doc.image(logoBuffer, 30, 22, { height: 44, fit: [44, 44] }); logoRendered = true; }
-      catch { /* skip */ }
+      try { doc.image(logoBuffer, ML, y, { height: 52, fit: [220, 52] }); }
+      catch {
+        doc.fillColor(dark).fontSize(14).font("B").text(company.name, ML, y + 3, { width: 220, lineBreak: false });
+        if (company.tagline) doc.fillColor(muted).fontSize(9).font("R").text(company.tagline, ML, y + 21, { width: 220, lineBreak: false });
+      }
+    } else {
+      doc.fillColor(dark).fontSize(14).font("B").text(company.name, ML, y + 3, { width: 220, lineBreak: false });
+      if (company.tagline) doc.fillColor(muted).fontSize(9).font("R").text(company.tagline, ML, y + 21, { width: 220, lineBreak: false });
     }
-    const nameX = logoRendered ? 82 : 30;
-    doc.fillColor(dark).fontSize(14).font("Helvetica-Bold")
-       .text(company.name, nameX, logoRendered ? 24 : 32, { width: 230, lineBreak: false });
-    if (company.tagline) {
-      doc.fillColor(muted).fontSize(8.5).font("Helvetica")
-         .text(company.tagline, nameX, logoRendered ? 44 : 50, { width: 230, lineBreak: false });
-    }
-    doc.fillColor(teal).fontSize(32).font("Helvetica-Bold")
-       .text("Invoice.", 330, 18, { width: 235, align: "right", lineBreak: false });
-    doc.fillColor(muted).fontSize(8).font("Helvetica")
-       .text("Document Payment Information", 330, 58, { width: 235, align: "right", lineBreak: false });
+    doc.fillColor(teal).fontSize(36).font("B")
+       .text("INVOICE.", ML, y + 8, { width: CW, align: "right", lineBreak: false });
 
-    // \u2500 White metadata card \u2500
-    const cX = 30, cY = 88, cW = 535;
-    const cardH = 178 + (invoice.milestone ? 22 : 0) + (invoice.notes ? 22 : 0);
-    doc.roundedRect(cX, cY, cW, cardH, 10).fill(white);
+    y = 97;
 
-    // Date / Due Date (top-left of card)
-    doc.fillColor(muted).fontSize(7.5).font("Helvetica-Bold")
-       .text("DATE", cX + 18, cY + 16, { lineBreak: false });
-    doc.fillColor(dark).fontSize(9.5).font("Helvetica")
-       .text(fmtDate(invoice.issueDate), cX + 18, cY + 27, { lineBreak: false });
-    doc.fillColor(muted).fontSize(7.5).font("Helvetica-Bold")
-       .text("DUE DATE", cX + 18, cY + 50, { lineBreak: false });
-    doc.fillColor(dark).fontSize(9.5).font("Helvetica")
-       .text(fmtDate(invoice.dueDate), cX + 18, cY + 61, { lineBreak: false });
+    // \u2500\u2500 Info bar (light gray) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    const infoBarH = 95;
+    doc.roundedRect(ML, y, CW, infoBarH, 6).fill(lightBg);
 
-    // Invoice number + Total Amount boxes (top-right of card)
-    const bx = cX + cW - 198;
-    doc.roundedRect(bx, cY + 10, 188, 27, 5).fill(lightBx);
-    doc.fillColor(muted).fontSize(7).font("Helvetica-Bold")
-       .text("INVOICE NUMBER", bx + 8, cY + 14, { lineBreak: false });
-    doc.fillColor(dark).fontSize(9.5).font("Helvetica-Bold")
-       .text(invoice.invoiceNumber, bx + 8, cY + 24, { lineBreak: false });
-
-    doc.roundedRect(bx, cY + 45, 188, 38, 5).fill(teal);
-    doc.fillColor(white).fontSize(7.5).font("Helvetica")
-       .text("TOTAL AMOUNT", bx, cY + 50, { width: 188, align: "center", lineBreak: false });
-    doc.fontSize(15).font("Helvetica-Bold")
-       .text(fmtAmt(invoice.total), bx, cY + 63, { width: 188, align: "center", lineBreak: false });
-
-    // Divider
-    doc.moveTo(cX + 15, cY + 92).lineTo(cX + cW - 15, cY + 92)
-       .strokeColor("#E2E8F0").lineWidth(0.5).stroke();
-
-    // "Invoice To:" pill + client info
-    doc.roundedRect(cX + 18, cY + 100, 72, 16, 8).fill(teal);
-    doc.fillColor(white).fontSize(7.5).font("Helvetica-Bold")
-       .text("Invoice To:", cX + 23, cY + 104, { lineBreak: false });
-
-    doc.fillColor(dark).fontSize(12).font("Helvetica-Bold")
-       .text(invoice.client.companyName, cX + 18, cY + 121, { lineBreak: false });
-    let cInfoY = cY + 138;
+    // Invoice To (left)
+    const invoiceToW = 175;
+    doc.fillColor(muted).fontSize(8).font("R")
+       .text("Invoice to :", ML + 14, y + 10, { lineBreak: false });
+    doc.fillColor(dark).fontSize(13).font("B")
+       .text(invoice.client.companyName, ML + 14, y + 22, { width: invoiceToW, lineBreak: false });
+    let ciY = y + 40;
     if (invoice.client.contactPerson) {
-      doc.fillColor(muted).fontSize(8.5).font("Helvetica")
-         .text(invoice.client.contactPerson, cX + 18, cInfoY, { lineBreak: false });
-      cInfoY += 13;
+      doc.fillColor(muted).fontSize(8.5).font("R")
+         .text(invoice.client.contactPerson, ML + 14, ciY, { width: invoiceToW, lineBreak: false });
+      ciY += 12;
     }
     if (invoice.client.email) {
-      doc.fillColor(muted).fontSize(8.5)
-         .text(invoice.client.email, cX + 18, cInfoY, { lineBreak: false });
-      cInfoY += 13;
+      doc.fillColor(muted).fontSize(8).font("R")
+         .text(invoice.client.email, ML + 14, ciY, { width: invoiceToW, lineBreak: false });
+      ciY += 12;
     }
-    if (invoice.client.gstNumber) {
-      doc.fillColor(muted).fontSize(7.5)
-         .text(`GSTIN: ${invoice.client.gstNumber}`, cX + 18, cInfoY, { lineBreak: false });
-    }
-
-    // Milestone / Notes (right side, below the boxes)
-    let noteY = cY + 100;
-    if (invoice.milestone) {
-      doc.fillColor(muted).fontSize(7).font("Helvetica-Bold")
-         .text("MILESTONE", bx, noteY, { lineBreak: false }); noteY += 12;
-      doc.fillColor(dark).fontSize(8.5).font("Helvetica")
-         .text(invoice.milestone, bx, noteY, { width: 188 }); noteY += 26;
-    }
-    if (invoice.notes) {
-      doc.fillColor(muted).fontSize(7).font("Helvetica-Bold")
-         .text("NOTES", bx, noteY, { lineBreak: false }); noteY += 12;
-      doc.fillColor(dark).fontSize(8.5).font("Helvetica")
-         .text(invoice.notes, bx, noteY, { width: 188 });
+    if (invoice.client.address) {
+      doc.fillColor(muted).fontSize(8).font("R")
+         .text(invoice.client.address, ML + 14, ciY, { width: invoiceToW, lineBreak: false });
     }
 
-    // \u2500 Two-column section \u2500
-    const colY = cY + cardH + 12;
-    const colH = 800 - colY;
-    const leftW = 120;
-    const rightX = cX + leftW + 14;
-    const rightW = cW - leftW - 14;
+    // Total Due (center)
+    const totalDueX = ML + 195;
+    const totalDueW = 145;
+    doc.fillColor(muted).fontSize(8).font("R")
+       .text("Total Due :", totalDueX, y + 28, { width: totalDueW, align: "center", lineBreak: false });
+    doc.fillColor(teal).fontSize(18).font("B")
+       .text(fmtAmt(invoice.total), totalDueX, y + 41, { width: totalDueW, align: "center", lineBreak: false });
 
-    // Left teal column
-    doc.roundedRect(cX, colY, leftW, colH, 8).fill(teal);
+    // Date + Invoice No (right)
+    const dateX = ML + 350;
+    const dateW = CW - 350;
+    doc.fillColor(muted).fontSize(7.5).font("R")
+       .text("Date :", dateX, y + 14, { width: dateW, lineBreak: false });
+    doc.fillColor(dark).fontSize(9).font("B")
+       .text(fmtDate(invoice.issueDate), dateX, y + 25, { width: dateW, lineBreak: false });
+    doc.fillColor(muted).fontSize(7.5).font("R")
+       .text("Invoice No :", dateX, y + 46, { width: dateW, lineBreak: false });
+    doc.fillColor(dark).fontSize(9).font("B")
+       .text(invoice.invoiceNumber, dateX, y + 57, { width: dateW, lineBreak: false });
 
-    // "Thank You!" rotated -90\u00B0
-    const tyAreaH = colH - 150;
-    doc.save();
-    doc.translate(cX + leftW / 2, colY + tyAreaH / 2);
-    doc.rotate(-90);
-    doc.fillColor(white).fontSize(20).font("Helvetica-Bold")
-       .text("Thank You!", -60, -10, { width: 120, align: "center", lineBreak: false });
-    doc.restore();
+    y += infoBarH + 14;
 
-    // Company email
-    if (company.email) {
-      doc.fillColor(white).fontSize(5.5).font("Helvetica")
-         .text(company.email, cX + 4, colY + tyAreaH + 6, { width: leftW - 8, align: "center", lineBreak: false });
-    }
+    // \u2500\u2500 Items table \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    const tX = ML, tW = CW;
+    const cItem  = 38;
+    const cPrice = 82;
+    const cQty   = 54;
+    const cAmt   = 82;
+    const cDesc  = tW - cItem - cPrice - cQty - cAmt;
 
-    // White T&C box at the bottom of left column
-    const tcBoxY = colY + colH - 140;
-    doc.roundedRect(cX + 6, tcBoxY, leftW - 12, 132, 5).fill(white);
-    doc.fillColor(teal).fontSize(6.5).font("Helvetica-Bold")
-       .text("T&C", cX + 11, tcBoxY + 6, { lineBreak: false });
-    const shortTerms = [
-      "1. Payment due within the specified period.",
-      "2. Late payments: 2% penalty/month.",
-      "3. Disputes within 7 days of receipt.",
-      "4. Services non-refundable unless agreed.",
-      "5. Subject to applicable taxes.",
-      "6. Bank charges borne by client.",
-    ].join("\n");
-    doc.fillColor(muted).fontSize(5).font("Helvetica")
-       .text(shortTerms, cX + 11, tcBoxY + 17, { width: leftW - 22 });
-
-    // Right column: white background + table
-    doc.roundedRect(rightX, colY, rightW, colH, 8).fill(white);
-
-    const tX = rightX + 5;
-    const tW = rightW - 10;
-    let tblY = colY + 8;
-
-    const d1 = tW * 0.44;
-    const d2 = tW * 0.20;
-    const d3 = tW * 0.15;
-    const d4 = tW - d1 - d2 - d3;
-
-    // Table header (teal)
-    doc.roundedRect(tX, tblY, tW, 22, 3).fill(teal);
-    doc.fillColor(white).fontSize(7.5).font("Helvetica-Bold");
-    doc.text("ITEM DESCRIPTION", tX + 5, tblY + 7, { width: d1 - 5, lineBreak: false });
-    doc.text("RATE",     tX + d1,           tblY + 7, { width: d2,      align: "right", lineBreak: false });
-    doc.text("UNIT",     tX + d1 + d2,      tblY + 7, { width: d3,      align: "right", lineBreak: false });
-    doc.text("SUBTOTAL", tX + d1 + d2 + d3, tblY + 7, { width: d4 - 5, align: "right", lineBreak: false });
-    tblY += 22;
+    const rowH = 24;
+    doc.roundedRect(tX, y, tW, rowH, 3).fill(teal);
+    doc.fillColor(white).fontSize(7.5).font("B");
+    doc.text("ITEM",         tX + 2,                                y + 8, { width: cItem,     align: "center", lineBreak: false });
+    doc.text("DESCRIPTIONS", tX + cItem + 4,                       y + 8, { width: cDesc - 4,                  lineBreak: false });
+    doc.text("PRICE",        tX + cItem + cDesc,                    y + 8, { width: cPrice,    align: "right",  lineBreak: false });
+    doc.text("QTY",          tX + cItem + cDesc + cPrice,           y + 8, { width: cQty,      align: "right",  lineBreak: false });
+    doc.text("AMOUNT",       tX + cItem + cDesc + cPrice + cQty,    y + 8, { width: cAmt - 4,  align: "right",  lineBreak: false });
+    y += rowH;
 
     invoice.lineItems.forEach((item, i) => {
-      if (i % 2 === 1) doc.rect(tX, tblY, tW, 20).fill(altRow);
-      doc.fillColor(dark).fontSize(8).font("Helvetica");
-      doc.text(item.description,          tX + 5,           tblY + 6, { width: d1 - 5, lineBreak: false });
-      doc.text(fmtAmt(item.unitPrice),    tX + d1,          tblY + 6, { width: d2,      align: "right", lineBreak: false });
-      doc.text(String(item.quantity),     tX + d1 + d2,     tblY + 6, { width: d3,      align: "right", lineBreak: false });
-      doc.text(fmtAmt(item.amount),       tX + d1 + d2 + d3, tblY + 6, { width: d4 - 5, align: "right", lineBreak: false });
-      tblY += 20;
+      if (i % 2 === 1) doc.rect(tX, y, tW, rowH).fill(altRow);
+      doc.fillColor(muted).fontSize(8.5).font("R")
+         .text(String(i + 1), tX + 2, y + 7, { width: cItem, align: "center", lineBreak: false });
+      doc.fillColor(dark).fontSize(8.5).font("R")
+         .text(item.description,       tX + cItem + 4,                     y + 7, { width: cDesc - 8,  lineBreak: false });
+      doc.text(fmtAmt(item.unitPrice), tX + cItem + cDesc,                  y + 7, { width: cPrice,    align: "right", lineBreak: false });
+      doc.text(String(item.quantity),  tX + cItem + cDesc + cPrice,         y + 7, { width: cQty,      align: "right", lineBreak: false });
+      doc.text(fmtAmt(item.amount),    tX + cItem + cDesc + cPrice + cQty,  y + 7, { width: cAmt - 4,  align: "right", lineBreak: false });
+      y += rowH;
     });
 
-    doc.moveTo(tX, tblY + 4).lineTo(tX + tW, tblY + 4)
-       .strokeColor("#CBD5E1").lineWidth(0.5).stroke();
-    tblY += 14;
+    y += 10;
 
-    doc.fillColor(muted).fontSize(8).font("Helvetica");
-    doc.text("Subtotal:",             tX + d1,           tblY, { width: d2 + d3, align: "right", lineBreak: false });
-    doc.text(fmtAmt(invoice.subtotal), tX + d1 + d2 + d3, tblY, { width: d4 - 5, align: "right", lineBreak: false });
-    tblY += 16;
+    // \u2500\u2500 Totals \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    const totStartX = ML + Math.round(CW * 0.55);
+    const totW      = CW - Math.round(CW * 0.55);
+    const amtColW   = 80;
+
+    doc.moveTo(totStartX, y).lineTo(ML + CW, y).strokeColor(borderC).lineWidth(0.5).stroke();
+    y += 8;
+
+    doc.fillColor(muted).fontSize(9).font("R");
+    doc.text("SUB TOTAL",              totStartX + 4, y, { width: totW - amtColW - 4, align: "right", lineBreak: false });
+    doc.text(fmtAmt(invoice.subtotal), totStartX + totW - amtColW, y, { width: amtColW - 4, align: "right", lineBreak: false });
+    y += 16;
 
     if (invoice.gstRate > 0) {
-      doc.text(`GST (${invoice.gstRate}%):`,    tX + d1,           tblY, { width: d2 + d3, align: "right", lineBreak: false });
-      doc.text(fmtAmt(invoice.gstAmount), tX + d1 + d2 + d3, tblY, { width: d4 - 5, align: "right", lineBreak: false });
-      tblY += 16;
+      doc.fillColor(muted).fontSize(9).font("R");
+      doc.text(`TAX ${invoice.gstRate}%`,  totStartX + 4, y, { width: totW - amtColW - 4, align: "right", lineBreak: false });
+      doc.text(fmtAmt(invoice.gstAmount), totStartX + totW - amtColW, y, { width: amtColW - 4, align: "right", lineBreak: false });
+      y += 16;
     }
 
-    tblY += 6;
-    doc.roundedRect(tX, tblY, tW, 26, 3).fill(teal);
-    doc.fillColor(white).fontSize(10).font("Helvetica-Bold");
-    doc.text("TOTAL:",              tX + d1,           tblY + 8, { width: d2 + d3, align: "right", lineBreak: false });
-    doc.text(fmtAmt(invoice.total), tX + d1 + d2 + d3, tblY + 8, { width: d4 - 5, align: "right", lineBreak: false });
+    y += 4;
+    doc.roundedRect(totStartX, y, totW, 24, 3).fill(teal);
+    doc.fillColor(white).fontSize(10).font("B");
+    doc.text("TOTAL",           totStartX + 4, y + 7, { width: totW - amtColW - 4, align: "right", lineBreak: false });
+    doc.text(fmtAmt(invoice.total), totStartX + totW - amtColW, y + 7, { width: amtColW - 4, align: "right", lineBreak: false });
+    y += 34;
 
-    // \u2500 Footer \u2500
-    doc.fillColor(muted).fontSize(7).font("Helvetica")
+    // Milestone
+    if (invoice.milestone) {
+      doc.fillColor(muted).fontSize(7.5).font("B").text("MILESTONE:", ML, y, { lineBreak: false });
+      y += 12;
+      doc.fillColor(dark).fontSize(9).font("R").text(invoice.milestone, ML, y, { width: CW * 0.55 });
+      y += 20;
+    }
+
+    y += 8;
+
+    // \u2500\u2500 Terms & Conditions \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    doc.moveTo(ML, y).lineTo(ML + CW, y).strokeColor(borderC).lineWidth(0.5).stroke();
+    y += 12;
+
+    doc.fillColor(dark).fontSize(11).font("B").text("Terms & Conditions", ML, y, { lineBreak: false });
+    y += 18;
+
+    const terms = [
+      "Payment is due within the agreed payment period from the date of invoice issuance.",
+      "A late payment charge of 2% per month may be applied to outstanding balances beyond the due date.",
+      "Any disputes regarding the invoice must be raised in writing within 7 days of receipt.",
+      "All services rendered are non-refundable unless otherwise agreed upon in writing by both parties.",
+      "Applicable taxes, duties, or government levies will be charged as per prevailing regulations.",
+      "Any bank transfer fees, transaction charges, or intermediary banking costs shall be borne by the client.",
+    ];
+
+    // Seal (right side)
+    const sealSize = 84;
+    const sealX = ML + CW - sealSize;
+    const sealY2 = y;
+    if (sealBuffer) {
+      try { doc.image(sealBuffer, sealX, sealY2, { fit: [sealSize, sealSize] }); }
+      catch { /* skip seal */ }
+    } else if (logoBuffer) {
+      // Fallback: draw double rings with logo inside
+      const sealCX = sealX + sealSize / 2;
+      const sealCY = sealY2 + sealSize / 2;
+      const sealR  = sealSize / 2;
+      doc.circle(sealCX, sealCY, sealR).strokeColor(teal).lineWidth(2).stroke();
+      doc.circle(sealCX, sealCY, sealR - 5).strokeColor(teal).lineWidth(0.5).stroke();
+      try { doc.image(logoBuffer, sealCX - 22, sealCY - 22, { fit: [44, 44] }); }
+      catch { /* skip */ }
+    }
+
+    const termsTextW = CW - 105;
+    terms.forEach((term, i) => {
+      doc.fillColor(muted).fontSize(7.5).font("R")
+         .text(`${i + 1}. ${term}`, ML, y, { width: termsTextW, lineBreak: false });
+      y += 14;
+    });
+
+    // Notes
+    if (invoice.notes) {
+      y += 8;
+      doc.fillColor(muted).fontSize(7.5).font("B").text("Notes:", ML, y, { lineBreak: false });
+      y += 12;
+      doc.fillColor(muted).fontSize(7.5).font("R").text(invoice.notes, ML, y, { width: CW });
+    }
+
+    // \u2500\u2500 Footer bar (teal) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    const footerY = H - 85;
+    doc.rect(0, footerY, W, 55).fill(teal);
+
+    // Helper: draw a Lucide-style icon scaled into PDF space
+    const drawFooterIcon = (type: "pin" | "phone" | "mail", ix: number, iy: number, sz: number) => {
+      const sc = sz / 24;
+      doc.save();
+      doc.translate(ix, iy).scale(sc, sc, { origin: [0, 0] });
+      if (type === "pin") {
+        doc.path("M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z")
+           .fillColor(white).fill();
+        doc.circle(12, 10, 3).fillColor(teal).fill();
+      } else if (type === "phone") {
+        doc.path("M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 13a19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 3.6 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z")
+           .strokeColor(white).lineWidth(2).lineCap("round").lineJoin("round").stroke();
+      } else {
+        doc.roundedRect(2, 4, 20, 16, 2).strokeColor(white).lineWidth(2).stroke();
+        doc.path("M22 7 13.03 12.7a1.94 1.94 0 0 1-2.06 0L2 7")
+           .strokeColor(white).lineWidth(2).lineCap("round").stroke();
+      }
+      doc.restore();
+    };
+
+    // Footer uses full page width (teal bar spans 0→W).
+    // Left pad = 20, "Thanks" block = 175pt wide, divider at x=195, contacts x=210→575
+    const footerPadX = 20;
+    const divX       = footerPadX + 175;          // 195
+    const contactX0  = divX + 15;                 // 210
+    const contactEnd = W - footerPadX;            // 575
+    const barCY      = footerY + 27.5;            // vertical centre of the 55pt bar
+
+    // Left text block — two lines centred vertically in bar
+    doc.fillColor(white).fontSize(9).font("B")
+       .text("Thanks for Business With Us!", footerPadX, footerY + 17, { lineBreak: false });
+    doc.fillColor(white).fontSize(7.5).font("R")
+       .text("We make easy for your Problems.", footerPadX, footerY + 31, { lineBreak: false });
+
+    // Vertical divider
+    doc.save();
+    doc.strokeOpacity(0.4)
+       .moveTo(divX, footerY + 9).lineTo(divX, footerY + 46)
+       .strokeColor(white).lineWidth(1).stroke();
+    doc.restore();
+
+    // Contact details — equal slots across contactX0→contactEnd, single line each
+    const contacts: Array<{ type: "pin" | "phone" | "mail"; text: string }> = [];
+    if (company.address) contacts.push({ type: "pin",   text: company.address });
+    if (company.phone)   contacts.push({ type: "phone", text: company.phone   });
+    if (company.email)   contacts.push({ type: "mail",  text: company.email   });
+
+    if (contacts.length > 0) {
+      const iconSz  = 11;
+      const textGap = 5;
+      const slotW   = (contactEnd - contactX0) / contacts.length; // ≈ 122pt each
+      const iconTop = barCY - iconSz / 2;
+      const textY   = barCY - 4;   // 8pt font visual centre
+
+      contacts.forEach((c, i) => {
+        // const sx = contactX0 + i * slotW;
+        const sx = contactX0 + i * slotW + (i > 0 ? 20 : 0);
+
+        drawFooterIcon(c.type, sx, iconTop, iconSz);
+        // No width — lineBreak:false renders the full string on one line
+        doc.fillColor(white).fontSize(8).font("R")
+           .text(c.text, sx + iconSz + textGap, textY, { lineBreak: false });
+      });
+    }
+
+    // \u2500\u2500 Bottom note \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    doc.fillColor(muted).fontSize(7.5).font("R")
        .text(
          "This is a computer-generated invoice and does not require a physical signature.",
-         30, 820, { width: 535, align: "center", lineBreak: false }
+         ML, H - 20, { width: CW, align: "center", lineBreak: false }
        );
 
     doc.end();
@@ -583,11 +665,11 @@ export async function getClientInvoiceBalance(req: Request, res: Response) {
 
     const [invoicedRow, paidRow] = await Promise.all([
       q<RowDataPacket>(
-        "SELECT COALESCE(SUM(total), 0) AS v FROM invoices WHERE client_id = ? AND status != 'CANCELLED'",
+        "SELECT COALESCE(SUM(subtotal), 0) AS v FROM invoices WHERE client_id = ? AND status != 'CANCELLED'",
         [Number(clientId)]
       ),
       q<RowDataPacket>(
-        "SELECT COALESCE(SUM(total), 0) AS v FROM invoices WHERE client_id = ? AND status = 'PAID'",
+        "SELECT COALESCE(SUM(subtotal), 0) AS v FROM invoices WHERE client_id = ? AND status = 'PAID'",
         [Number(clientId)]
       ),
     ]);

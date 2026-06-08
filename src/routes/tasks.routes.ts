@@ -15,6 +15,9 @@ import {
   deleteComment,
   uploadAttachment,
   deleteAttachment,
+  createTaskSubtask,
+  updateTaskSubtask,
+  deleteTaskSubtask,
 } from "../controllers/tasks.controller";
 
 const router = Router();
@@ -41,5 +44,10 @@ router.delete("/:uuid/comments/:commentId",   deleteComment);
 // Attachments
 router.post("/:uuid/attachments",             attachUploader.single("file"), uploadAttachment);
 router.delete("/:uuid/attachments/:attachId", deleteAttachment);
+
+// Subtasks
+router.post("/:uuid/subtasks",              createTaskSubtask);
+router.patch("/:uuid/subtasks/:subUuid",    updateTaskSubtask);
+router.delete("/:uuid/subtasks/:subUuid",   deleteTaskSubtask);
 
 export default router;

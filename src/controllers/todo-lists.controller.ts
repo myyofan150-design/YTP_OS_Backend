@@ -63,10 +63,24 @@ async function syncListMembers(listId: number, addedBy: number, userIds: number[
   }
 }
 
+// Access condition for a single list row (SQL fragment, caller supplies params)
+// A user can see a list when:
+//   1. They created it
+//   2. They are the assigned_to user
+//   3. They are in todo_list_members
+//   4. The list's parent group is shared with them AND the list is not private
+const LIST_ACCESS = `
+  (l.created_by = ?
+   OR l.assigned_to = ?
+   OR EXISTS (SELECT 1 FROM todo_list_members lm WHERE lm.list_id = l.id AND lm.user_id = ?)
+   OR (l.is_private = FALSE AND l.group_id IS NOT NULL
+       AND EXISTS (SELECT 1 FROM todo_group_members gm WHERE gm.group_id = l.group_id AND gm.user_id = ?)))
+`;
+
 // Correlated-subquery SELECTs for list rows — avoids GROUP BY + ONLY_FULL_GROUP_BY issues
 const LIST_SEL = `
   l.id, l.uuid, l.group_id AS groupId, l.name, l.color,
-  l.is_favorite AS isFavorite, l.assigned_to AS assignedTo,
+  l.is_favorite AS isFavorite, l.is_private AS isPrivate, l.assigned_to AS assignedTo,
   l.sort_order AS sortOrder, l.created_by AS createdBy, l.created_at AS createdAt,
   g.name AS groupName, g.uuid AS groupUuid, g.color AS groupColor,
   (SELECT COUNT(*) FROM todo_tasks t WHERE t.list_id = l.id) AS taskCount,
@@ -86,11 +100,8 @@ export async function listLists(req: Request, res: Response): Promise<void> {
     const params: unknown[]    = [];
 
     if (!showAll) {
-      // Own lists OR single-assigned OR shared via todo_list_members
-      conditions.push(
-        "(l.created_by = ? OR l.assigned_to = ? OR EXISTS (SELECT 1 FROM todo_list_members lm WHERE lm.list_id = l.id AND lm.user_id = ?))"
-      );
-      params.push(userId, userId, userId);
+      conditions.push(LIST_ACCESS);
+      params.push(userId, userId, userId, userId);
     }
 
     if (req.query["groupId"]) {
@@ -106,12 +117,15 @@ export async function listLists(req: Request, res: Response): Promise<void> {
       conditions.push("l.is_favorite = 1");
     }
 
-    // Optionally show only lists shared with the user (not owned)
     if (req.query["sharedWithMe"] === "true") {
       conditions.push(
-        "l.created_by != ? AND EXISTS (SELECT 1 FROM todo_list_members lm WHERE lm.list_id = l.id AND lm.user_id = ?)"
+        `l.created_by != ? AND (
+          EXISTS (SELECT 1 FROM todo_list_members lm WHERE lm.list_id = l.id AND lm.user_id = ?)
+          OR (l.is_private = FALSE AND l.group_id IS NOT NULL
+              AND EXISTS (SELECT 1 FROM todo_group_members gm WHERE gm.group_id = l.group_id AND gm.user_id = ?))
+        )`
       );
-      params.push(userId, userId);
+      params.push(userId, userId, userId);
     }
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -136,7 +150,7 @@ export async function listLists(req: Request, res: Response): Promise<void> {
 
 export async function createList(req: Request, res: Response): Promise<void> {
   try {
-    const { name, groupId, color, assignedTo, memberUserIds } = req.body as Record<string, unknown>;
+    const { name, groupId, color, assignedTo, isPrivate, memberUserIds } = req.body as Record<string, unknown>;
     if (!name) {
       res.status(400).json({ success: false, message: "name is required" }); return;
     }
@@ -156,19 +170,19 @@ export async function createList(req: Request, res: Response): Promise<void> {
     }
 
     const result = await run(
-      "INSERT INTO todo_lists (name, group_id, color, assigned_to, created_by) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO todo_lists (name, group_id, color, assigned_to, is_private, created_by) VALUES (?, ?, ?, ?, ?, ?)",
       [
         String(name),
         groupDbId,
         color      ? String(color)       : "#6366F1",
         assignedTo ? Number(assignedTo)  : null,
+        isPrivate  ? 1                   : 0,
         userId,
       ]
     );
 
     const listId = result.insertId;
 
-    // Insert optional multi-employee members
     const ids = Array.isArray(memberUserIds)
       ? (memberUserIds as unknown[]).map(Number).filter(n => !isNaN(n) && n > 0)
       : [];
@@ -203,7 +217,8 @@ export async function getList(req: Request, res: Response): Promise<void> {
 
     const listRows = await q<RowDataPacket>(
       `SELECT l.id, l.uuid, l.group_id AS groupId, l.name, l.color,
-              l.is_favorite AS isFavorite, l.assigned_to AS assignedTo,
+              l.is_favorite AS isFavorite, l.is_private AS isPrivate,
+              l.assigned_to AS assignedTo,
               l.sort_order AS sortOrder, l.created_by AS createdBy, l.created_at AS createdAt,
               g.name AS groupName, g.uuid AS groupUuid
        FROM todo_lists l
@@ -213,22 +228,19 @@ export async function getList(req: Request, res: Response): Promise<void> {
     );
     if (!listRows[0]) { res.status(404).json({ success: false, message: "List not found" }); return; }
 
-    const list = listRows[0];
+    const list   = listRows[0];
     const listId = Number(list["id"]);
 
-    // Check membership
-    const isMember = await q<RowDataPacket>(
-      "SELECT 1 FROM todo_list_members WHERE list_id = ? AND user_id = ?",
-      [listId, userId]
-    );
-
-    if (
-      !isAdmin &&
-      Number(list["createdBy"]) !== userId &&
-      Number(list["assignedTo"]) !== userId &&
-      isMember.length === 0
-    ) {
-      res.status(403).json({ success: false, message: "Forbidden" }); return;
+    if (!isAdmin && Number(list["createdBy"]) !== userId && Number(list["assignedTo"]) !== userId) {
+      const accessRow = await q<RowDataPacket>(
+        `SELECT 1 FROM todo_list_members WHERE list_id = ? AND user_id = ?
+         UNION ALL
+         SELECT 1 FROM todo_group_members gm
+           WHERE gm.user_id = ? AND gm.group_id = ? AND ? = FALSE
+         LIMIT 1`,
+        [listId, userId, userId, list["groupId"] ?? 0, list["isPrivate"] ? 1 : 0]
+      );
+      if (!accessRow[0]) { res.status(403).json({ success: false, message: "Forbidden" }); return; }
     }
 
     const tasks = await q<RowDataPacket>(
@@ -260,6 +272,7 @@ export async function getList(req: Request, res: Response): Promise<void> {
 }
 
 // ─── updateList ───────────────────────────────────────────────────────────────
+// Only the list creator can edit properties or manage members
 
 export async function updateList(req: Request, res: Response): Promise<void> {
   try {
@@ -273,13 +286,15 @@ export async function updateList(req: Request, res: Response): Promise<void> {
     if (!rows[0]) { res.status(404).json({ success: false, message: "List not found" }); return; }
 
     const listId = Number(rows[0]["id"]);
-    const { name, color, groupId, assignedTo, isFavorite, sortOrder, memberUserIds } = req.body as Record<string, unknown>;
+    const { name, color, groupId, assignedTo, isFavorite, isPrivate, sortOrder, memberUserIds } =
+      req.body as Record<string, unknown>;
     const sets: string[] = [];
     const p: unknown[]   = [];
 
     if (name       != null)      { sets.push("name = ?");        p.push(String(name)); }
     if (color      != null)      { sets.push("color = ?");       p.push(String(color)); }
     if (isFavorite != null)      { sets.push("is_favorite = ?"); p.push(isFavorite ? 1 : 0); }
+    if (isPrivate  != null)      { sets.push("is_private = ?");  p.push(isPrivate  ? 1 : 0); }
     if (sortOrder  != null)      { sets.push("sort_order = ?");  p.push(Number(sortOrder)); }
     if (assignedTo !== undefined) { sets.push("assigned_to = ?"); p.push(assignedTo ? Number(assignedTo) : null); }
 
@@ -298,7 +313,6 @@ export async function updateList(req: Request, res: Response): Promise<void> {
       await run(`UPDATE todo_lists SET ${sets.join(", ")} WHERE id = ?`, p);
     }
 
-    // Replace members if provided
     if (memberUserIds !== undefined) {
       const ids = Array.isArray(memberUserIds)
         ? (memberUserIds as unknown[]).map(Number).filter(n => !isNaN(n) && n > 0)
@@ -426,17 +440,19 @@ export async function getListMembers(req: Request, res: Response): Promise<void>
     const userId   = req.user!.id;
     const isAdmin  = ["SUPER_ADMIN", "ADMIN"].includes(req.user!.role);
 
-    const listRows = await q<RowDataPacket>("SELECT id, created_by AS createdBy FROM todo_lists WHERE uuid = ?", [uuid]);
+    const listRows = await q<RowDataPacket>(
+      "SELECT id, created_by AS createdBy FROM todo_lists WHERE uuid = ?",
+      [uuid]
+    );
     if (!listRows[0]) { res.status(404).json({ success: false, message: "List not found" }); return; }
 
     const listId = Number(listRows[0]["id"]);
-    const isMember = await q<RowDataPacket>(
-      "SELECT 1 FROM todo_list_members WHERE list_id = ? AND user_id = ?",
-      [listId, userId]
-    );
-
-    if (!isAdmin && Number(listRows[0]["createdBy"]) !== userId && isMember.length === 0) {
-      res.status(403).json({ success: false, message: "Forbidden" }); return;
+    if (!isAdmin && Number(listRows[0]["createdBy"]) !== userId) {
+      const isMember = await q<RowDataPacket>(
+        "SELECT 1 FROM todo_list_members WHERE list_id = ? AND user_id = ?",
+        [listId, userId]
+      );
+      if (!isMember[0]) { res.status(403).json({ success: false, message: "Forbidden" }); return; }
     }
 
     const members = await fetchListMembers(listId);
@@ -448,7 +464,6 @@ export async function getListMembers(req: Request, res: Response): Promise<void>
 }
 
 // ─── addListMembers ───────────────────────────────────────────────────────────
-// Body: { userIds: number[] }
 
 export async function addListMembers(req: Request, res: Response): Promise<void> {
   try {
@@ -484,7 +499,6 @@ export async function addListMembers(req: Request, res: Response): Promise<void>
 }
 
 // ─── removeListMember ─────────────────────────────────────────────────────────
-// DELETE /api/todo/lists/:uuid/members/:memberId  (memberId = users.id)
 
 export async function removeListMember(req: Request, res: Response): Promise<void> {
   try {

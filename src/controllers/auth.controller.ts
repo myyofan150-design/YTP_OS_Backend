@@ -232,10 +232,13 @@ export async function me(req: Request, res: Response): Promise<void> {
     const rows = await q<RowDataPacket>(
       `SELECT u.id, u.uuid, u.name, u.email, u.role, u.status,
               u.avatar_url AS avatarUrl, u.last_login_at AS lastLoginAt, u.created_at AS createdAt,
-              u.two_factor_enabled AS twoFactorEnabled,
+              u.two_factor_enabled AS twoFactorEnabled, u.client_id AS clientId,
               e.id AS empId, e.employee_code AS employeeCode, e.department, e.designation,
-              e.joining_date AS joiningDate
-       FROM users u LEFT JOIN employees e ON e.user_id = u.id
+              e.joining_date AS joiningDate,
+              c.uuid AS clientUuid, c.company_name AS clientCompanyName, c.logo_url AS clientLogoUrl
+       FROM users u
+       LEFT JOIN employees e ON e.user_id = u.id
+       LEFT JOIN clients c ON c.id = u.client_id
        WHERE u.id = ?`,
       [req.user!.id]
     );
@@ -252,6 +255,10 @@ export async function me(req: Request, res: Response): Promise<void> {
         employee: row["empId"] ? {
           id: row["empId"], employeeCode: row["employeeCode"],
           department: row["department"], designation: row["designation"], joiningDate: row["joiningDate"],
+        } : null,
+        client: row["clientId"] ? {
+          id: row["clientId"], uuid: row["clientUuid"],
+          companyName: row["clientCompanyName"], logoUrl: row["clientLogoUrl"],
         } : null,
       },
     });

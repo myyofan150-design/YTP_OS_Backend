@@ -3,7 +3,7 @@ import type { RowDataPacket } from 'mysql2';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export type UserRole = 'SUPER_ADMIN' | 'ADMIN' | 'HR' | 'TEAM_LEAD' | 'EMPLOYEE' | 'ACCOUNTANT';
+export type UserRole = 'SUPER_ADMIN' | 'ADMIN' | 'HR' | 'TEAM_LEAD' | 'EMPLOYEE' | 'ACCOUNTANT' | 'CLIENT';
 export type UserStatus = 'ACTIVE' | 'INACTIVE' | 'SUSPENDED';
 
 export interface UserRow extends RowDataPacket {
@@ -17,6 +17,7 @@ export interface UserRow extends RowDataPacket {
   lastLoginAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
+  clientId: number | null;
 }
 
 export interface UserAuthRow extends RowDataPacket {
@@ -58,7 +59,8 @@ export interface UpdateUserInput {
 const SELECT_PUBLIC = `
   SELECT id, uuid, name, email, role, status,
          avatar_url AS avatarUrl, last_login_at AS lastLoginAt,
-         created_at AS createdAt, updated_at AS updatedAt
+         created_at AS createdAt, updated_at AS updatedAt,
+         client_id AS clientId
   FROM users
 `;
 

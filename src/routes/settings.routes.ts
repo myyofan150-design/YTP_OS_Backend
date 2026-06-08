@@ -3,7 +3,7 @@ import { Router } from "express";
 import { authenticate } from "../middleware/auth.middleware";
 import { requireRole } from "../middleware/role.middleware";
 import { createUploader } from "../lib/storage";
-import { getGeneralSettings, updateGeneralSettings, uploadCompanyLogo } from "../controllers/settings.controller";
+import { getGeneralSettings, updateGeneralSettings, uploadCompanyLogo, uploadCompanySeal, uploadSidebarIcon } from "../controllers/settings.controller";
 
 const router = Router();
 const logoUploader = createUploader("settings", 2);
@@ -12,5 +12,7 @@ const logoUploader = createUploader("settings", 2);
 router.get("/general",       getGeneralSettings);
 router.patch("/general",     authenticate, requireRole("SUPER_ADMIN"), updateGeneralSettings);
 router.post("/general/logo", authenticate, requireRole("SUPER_ADMIN"), logoUploader.single("logo"), uploadCompanyLogo);
+router.post("/general/seal",         authenticate, requireRole("SUPER_ADMIN"), logoUploader.single("seal"),         uploadCompanySeal);
+router.post("/general/sidebar-icon", authenticate, requireRole("SUPER_ADMIN"), logoUploader.single("sidebarIcon"), uploadSidebarIcon);
 
 export default router;

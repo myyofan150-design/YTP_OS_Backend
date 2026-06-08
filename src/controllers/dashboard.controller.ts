@@ -19,7 +19,13 @@ export async function getStats(_req: Request, res: Response) {
       q<RowDataPacket>("SELECT status, COUNT(*) AS cnt FROM clients GROUP BY status"),
       q<RowDataPacket>("SELECT status, COUNT(*) AS cnt FROM employees GROUP BY status"),
       q<RowDataPacket>("SELECT status, COUNT(*) AS cnt FROM tasks WHERE parent_task_id IS NULL GROUP BY status"),
-      q<RowDataPacket>("SELECT status, COUNT(*) AS cnt FROM todo_tasks GROUP BY status"),
+      q<RowDataPacket>(
+        `SELECT COUNT(*) AS total,
+                COALESCE(SUM(status = 'pending' AND stage = 'todo'),        0) AS urgent,
+                COALESCE(SUM(status = 'pending' AND stage = 'inprogress'),  0) AS inProgress,
+                COALESCE(SUM(status = 'completed'),                         0) AS completed
+         FROM todo_tasks`
+      ),
       q<RowDataPacket>(`SELECT COALESCE(SUM(total),0) AS total FROM invoices WHERE issue_date LIKE ? AND status != 'CANCELLED'`, [`${monthStr}%`]),
       q<RowDataPacket>("SELECT status, COUNT(*) AS cnt FROM invoices GROUP BY status"),
       q<RowDataPacket>("SELECT status, COUNT(*) AS cnt FROM payroll_records WHERE month = ? AND year = ? GROUP BY status", [m, y]),
@@ -35,7 +41,6 @@ export async function getStats(_req: Request, res: Response) {
     const cl = byStatus(clients);
     const em = byStatus(employees);
     const tk = byStatus(tasks);
-    const td = byStatus(todos);
     const iv = byStatus(invoiceCounts);
     const pr = byStatus(payroll);
 
@@ -45,7 +50,7 @@ export async function getStats(_req: Request, res: Response) {
         clients:   { total: clients.reduce((s,r) => s+Number(r["cnt"]),0), active: cl["ACTIVE"]??0, prospect: cl["PROSPECT"]??0 },
         employees: { total: employees.reduce((s,r) => s+Number(r["cnt"]),0), active: em["ACTIVE"]??0 },
         tasks:     { total: tasks.reduce((s,r) => s+Number(r["cnt"]),0), todo: tk["TODO"]??0, inProgress: tk["IN_PROGRESS"]??0, done: tk["DONE"]??0 },
-        todos:     { total: todos.reduce((s,r) => s+Number(r["cnt"]),0), pending: td["pending"]??0, completed: td["completed"]??0 },
+        todos:     { total: Number(todos[0]?.["total"]??0), urgent: Number(todos[0]?.["urgent"]??0), inProgress: Number(todos[0]?.["inProgress"]??0), completed: Number(todos[0]?.["completed"]??0) },
         invoices:  { thisMonthTotal: Number(invoiceMonth[0]?.["total"]??0), paid: iv["PAID"]??0, pending: iv["SENT"]??0, overdue: 0 },
         payroll:   { thisMonth: payroll.reduce((s,r) => s+Number(r["cnt"]),0), paid: pr["PAID"]??0, draft: pr["DRAFT"]??0 },
         renewals:  { count: renewals.length, list: renewals },

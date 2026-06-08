@@ -11,6 +11,27 @@ import { uploadFile, deleteFile } from "../lib/storage";
 const ALLOWED_ATTACHMENT_EXTS = [".pdf", ".docx", ".xlsx", ".png", ".jpg", ".jpeg", ".zip"];
 const VALID_REPEAT_TYPES = ["none", "daily", "weekdays", "weekly", "monthly", "yearly", "custom"];
 
+// Full task-level access condition (SQL fragment). Bind: userId × 6
+// A user can see a task when they:
+//   1. Created it
+//   2. Are the assigned_to user
+//   3. Are in todo_task_members
+//   4. Are in todo_list_members for the task's list
+//   5. Are the list's assigned_to user
+//   6. Are a group member of the list's parent group AND the list is not private
+const TASK_ACCESS = `
+  (t.created_by = ?
+   OR t.assigned_to = ?
+   OR EXISTS (SELECT 1 FROM todo_task_members tm WHERE tm.task_id = t.id AND tm.user_id = ?)
+   OR EXISTS (SELECT 1 FROM todo_list_members lm WHERE lm.list_id = t.list_id AND lm.user_id = ?)
+   OR EXISTS (SELECT 1 FROM todo_lists tl2 WHERE tl2.id = t.list_id AND tl2.assigned_to = ?)
+   OR EXISTS (
+       SELECT 1 FROM todo_group_members gm
+       JOIN todo_lists tl3 ON tl3.id = t.list_id
+       WHERE gm.group_id = tl3.group_id AND gm.user_id = ? AND tl3.is_private = FALSE
+   ))
+`;
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function logTodo(taskId: number, userId: number, action: string, detail: string): Promise<void> {
@@ -76,7 +97,7 @@ async function setTodoTaskMembers(taskId: number, memberIds: number[], addedById
   await run("DELETE FROM todo_task_members WHERE task_id = ?", [taskId]);
   for (const uid of memberIds) {
     await run(
-      "INSERT IGNORE INTO todo_task_members (task_id, user_id, added_by) VALUES (?, ?, ?)",
+      "INSERT IGNORE INTO todo_task_members (task_id, user_id, added_by_id) VALUES (?, ?, ?)",
       [taskId, uid, addedById]
     );
   }
@@ -130,16 +151,8 @@ export async function listTasks(req: Request, res: Response): Promise<void> {
     }
 
     if (!showAll) {
-      // Employee sees tasks they own, are assigned to directly, are a task-member of,
-      // are a list-member of, or whose list is assigned to them.
-      conditions.push(
-        `(t.created_by = ?
-          OR t.assigned_to = ?
-          OR EXISTS (SELECT 1 FROM todo_task_members tm WHERE tm.task_id = t.id AND tm.user_id = ?)
-          OR EXISTS (SELECT 1 FROM todo_list_members lm WHERE lm.list_id = t.list_id AND lm.user_id = ?)
-          OR EXISTS (SELECT 1 FROM todo_lists tl WHERE tl.id = t.list_id AND tl.assigned_to = ?))`
-      );
-      params.push(userId, userId, userId, userId, userId);
+      conditions.push(TASK_ACCESS);
+      params.push(userId, userId, userId, userId, userId, userId);
     }
 
     const { search, status, priority, dueDate } = req.query as Record<string, string | undefined>;
@@ -187,8 +200,10 @@ export async function createTask(req: Request, res: Response): Promise<void> {
     const lRows = await q<RowDataPacket>(
       `SELECT l.id FROM todo_lists l WHERE l.uuid = ?
        AND (l.created_by = ? OR l.assigned_to = ?
-            OR EXISTS (SELECT 1 FROM todo_list_members lm WHERE lm.list_id = l.id AND lm.user_id = ?))`,
-      [listUuid, userId, userId, userId]
+            OR EXISTS (SELECT 1 FROM todo_list_members lm WHERE lm.list_id = l.id AND lm.user_id = ?)
+            OR (l.is_private = FALSE AND l.group_id IS NOT NULL
+                AND EXISTS (SELECT 1 FROM todo_group_members gm WHERE gm.group_id = l.group_id AND gm.user_id = ?)))`,
+      [listUuid, userId, userId, userId, userId]
     );
     if (!lRows[0]) { res.status(404).json({ success: false, message: "List not found" }); return; }
     const listId = Number(lRows[0]["id"]);
@@ -267,8 +282,11 @@ export async function getTask(req: Request, res: Response): Promise<void> {
         `SELECT 1 FROM todo_task_members WHERE task_id = ? AND user_id = ?
          UNION ALL SELECT 1 FROM todo_list_members WHERE list_id = ? AND user_id = ?
          UNION ALL SELECT 1 FROM todo_lists WHERE id = ? AND assigned_to = ?
+         UNION ALL SELECT 1 FROM todo_group_members gm
+           JOIN todo_lists tl ON tl.id = ? AND tl.is_private = FALSE
+           WHERE gm.group_id = tl.group_id AND gm.user_id = ?
          LIMIT 1`,
-        [task["id"], userId, task["listId"], userId, task["listId"], userId]
+        [task["id"], userId, task["listId"], userId, task["listId"], userId, task["listId"], userId]
       );
       if (!accessRow[0]) { res.status(403).json({ success: false, message: "Forbidden" }); return; }
     }
@@ -358,18 +376,31 @@ export async function updateTask(req: Request, res: Response): Promise<void> {
     const isAssigned = Number(task["assignedTo"]) === userId;
 
     if (!isCreator && !isAdmin) {
+      // Verify general access (assigned, task member, list member, or group member)
       if (!isAssigned) {
-        const memberRow = await q<RowDataPacket>(
-          "SELECT 1 FROM todo_task_members WHERE task_id = ? AND user_id = ? LIMIT 1",
-          [task["id"], userId]
+        const accessRow = await q<RowDataPacket>(
+          `SELECT 1 FROM todo_task_members WHERE task_id = ? AND user_id = ?
+           UNION ALL SELECT 1 FROM todo_list_members WHERE list_id = ? AND user_id = ?
+           UNION ALL SELECT 1 FROM todo_lists WHERE id = ? AND assigned_to = ?
+           UNION ALL SELECT 1 FROM todo_group_members gm
+             JOIN todo_lists tl ON tl.id = ? AND tl.is_private = FALSE
+             WHERE gm.group_id = tl.group_id AND gm.user_id = ?
+           LIMIT 1`,
+          [task["id"], userId, task["listId"], userId, task["listId"], userId, task["listId"], userId]
         );
-        if (!memberRow[0]) { res.status(403).json({ success: false, message: "Forbidden" }); return; }
+        if (!accessRow[0]) { res.status(403).json({ success: false, message: "Forbidden" }); return; }
       }
-      // Assigned-only users can change only status
+      // Non-creators can only change status — not title, assignment, priority etc.
       const bodyKeys = Object.keys(req.body as Record<string, unknown>);
       if (bodyKeys.some(k => k !== "status")) {
-        res.status(403).json({ success: false, message: "Assigned users can only update task status" }); return;
+        res.status(403).json({ success: false, message: "Only the task creator can edit task details" }); return;
       }
+    }
+
+    // Only creator or admin can reassign (change assignedTo or memberIds)
+    const body = req.body as Record<string, unknown>;
+    if (!isCreator && !isAdmin && ("assignedTo" in body || "memberIds" in body)) {
+      res.status(403).json({ success: false, message: "Only the task creator can assign or reassign members" }); return;
     }
 
     const { title, description, status, priority, stage, dueDate, dueTime,
@@ -464,11 +495,16 @@ export async function deleteTask(req: Request, res: Response): Promise<void> {
     if (!task) { res.status(404).json({ success: false, message: "Task not found" }); return; }
 
     if (!isAdmin && Number(task["createdBy"]) !== userId && Number(task["assignedTo"]) !== userId) {
-      const memberRow = await q<RowDataPacket>(
-        "SELECT 1 FROM todo_task_members WHERE task_id = ? AND user_id = ? LIMIT 1",
-        [task["id"], userId]
+      const accessRow = await q<RowDataPacket>(
+        `SELECT 1 FROM todo_task_members WHERE task_id = ? AND user_id = ?
+         UNION ALL SELECT 1 FROM todo_list_members WHERE list_id = ? AND user_id = ?
+         UNION ALL SELECT 1 FROM todo_group_members gm
+           JOIN todo_lists tl ON tl.id = ? AND tl.is_private = FALSE
+           WHERE gm.group_id = tl.group_id AND gm.user_id = ?
+         LIMIT 1`,
+        [task["id"], userId, task["listId"], userId, task["listId"], userId]
       );
-      if (!memberRow[0]) {
+      if (!accessRow[0]) {
         res.status(403).json({ success: false, message: "Forbidden" }); return;
       }
     }
@@ -503,11 +539,16 @@ export async function updateTaskStatus(req: Request, res: Response): Promise<voi
     const isAssigned = Number(task["assignedTo"]) === userId;
     const isAdmin    = ["SUPER_ADMIN", "ADMIN"].includes(req.user!.role);
     if (!isCreator && !isAssigned && !isAdmin) {
-      const memberRow = await q<RowDataPacket>(
-        "SELECT 1 FROM todo_task_members WHERE task_id = ? AND user_id = ? LIMIT 1",
-        [task["id"], userId]
+      const accessRow = await q<RowDataPacket>(
+        `SELECT 1 FROM todo_task_members WHERE task_id = ? AND user_id = ?
+         UNION ALL SELECT 1 FROM todo_list_members WHERE list_id = ? AND user_id = ?
+         UNION ALL SELECT 1 FROM todo_group_members gm
+           JOIN todo_lists tl ON tl.id = ? AND tl.is_private = FALSE
+           WHERE gm.group_id = tl.group_id AND gm.user_id = ?
+         LIMIT 1`,
+        [task["id"], userId, task["listId"], userId, task["listId"], userId]
       );
-      if (!memberRow[0]) { res.status(403).json({ success: false, message: "Forbidden" }); return; }
+      if (!accessRow[0]) { res.status(403).json({ success: false, message: "Forbidden" }); return; }
     }
 
     const newStatus = task["status"] === "pending" ? "completed" : "pending";
@@ -615,13 +656,18 @@ export async function listSubtasks(req: Request, res: Response): Promise<void> {
 
     const task = await resolveTask(uuid);
     if (!task) { res.status(404).json({ success: false, message: "Task not found" }); return; }
-    if (Number(task["createdBy"]) !== userId && Number(task["assignedTo"]) !== userId
-        && !["SUPER_ADMIN", "ADMIN"].includes(req.user!.role)) {
-      const memberRow = await q<RowDataPacket>(
-        "SELECT 1 FROM todo_task_members WHERE task_id = ? AND user_id = ? LIMIT 1",
-        [task["id"], userId]
+    const isAdmin_sub = ["SUPER_ADMIN", "ADMIN"].includes(req.user!.role);
+    if (!isAdmin_sub && Number(task["createdBy"]) !== userId && Number(task["assignedTo"]) !== userId) {
+      const accessRow = await q<RowDataPacket>(
+        `SELECT 1 FROM todo_task_members WHERE task_id = ? AND user_id = ?
+         UNION ALL SELECT 1 FROM todo_list_members WHERE list_id = ? AND user_id = ?
+         UNION ALL SELECT 1 FROM todo_group_members gm
+           JOIN todo_lists tl ON tl.id = ? AND tl.is_private = FALSE
+           WHERE gm.group_id = tl.group_id AND gm.user_id = ?
+         LIMIT 1`,
+        [task["id"], userId, task["listId"], userId, task["listId"], userId]
       );
-      if (!memberRow[0]) { res.status(403).json({ success: false, message: "Forbidden" }); return; }
+      if (!accessRow[0]) { res.status(403).json({ success: false, message: "Forbidden" }); return; }
     }
 
     const subtasks = await q<RowDataPacket>(
@@ -1058,6 +1104,56 @@ export async function updateRepeat(req: Request, res: Response): Promise<void> {
 
 // ─── Smart Views ──────────────────────────────────────────────────────────────
 
+export async function getSmartCounts(req: Request, res: Response): Promise<void> {
+  try {
+    const userId = req.user!.id;
+    const [today, importantTasks, assignedToMe, overdue, completed] = await Promise.all([
+      q<RowDataPacket>(
+        `SELECT COUNT(*) AS cnt FROM todo_tasks t
+         WHERE t.due_date = CURDATE() AND ${TASK_ACCESS}`,
+        [userId, userId, userId, userId, userId, userId]
+      ),
+      q<RowDataPacket>(
+        `SELECT COUNT(*) AS cnt FROM todo_tasks t
+         WHERE t.is_favorite = 1 AND t.created_by = ? AND t.status = 'pending'`,
+        [userId]
+      ),
+      q<RowDataPacket>(
+        `SELECT COUNT(*) AS cnt FROM todo_tasks t
+         WHERE t.created_by != ?
+           AND (t.assigned_to = ? OR EXISTS (SELECT 1 FROM todo_task_members tm WHERE tm.task_id = t.id AND tm.user_id = ?))
+           AND t.status = 'pending'`,
+        [userId, userId, userId]
+      ),
+      q<RowDataPacket>(
+        `SELECT COUNT(*) AS cnt FROM todo_tasks t
+         WHERE t.due_date < CURDATE() AND t.status = 'pending' AND ${TASK_ACCESS}`,
+        [userId, userId, userId, userId, userId, userId]
+      ),
+      q<RowDataPacket>(
+        `SELECT COUNT(*) AS cnt FROM todo_tasks t
+         WHERE t.status = 'completed' AND t.created_by = ?
+           AND t.completed_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)`,
+        [userId]
+      ),
+    ]);
+    res.json({
+      success: true,
+      message: "OK",
+      data: {
+        today:           Number(today[0]?.["cnt"] ?? 0),
+        important:       Number(importantTasks[0]?.["cnt"] ?? 0),
+        "assigned-to-me": Number(assignedToMe[0]?.["cnt"] ?? 0),
+        overdue:         Number(overdue[0]?.["cnt"] ?? 0),
+        completed:       Number(completed[0]?.["cnt"] ?? 0),
+      },
+    });
+  } catch (err) {
+    console.error("[todo-tasks/smart-counts]", err);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+}
+
 const SMART_TASK_SEL = `
   t.id, t.uuid, t.title, t.status, t.priority,
   t.due_date AS dueDate, t.due_time AS dueTime,
@@ -1080,13 +1176,9 @@ export async function getSmartView(req: Request, res: Response): Promise<void> {
            FROM todo_tasks t
            JOIN todo_lists l ON l.id = t.list_id
            WHERE t.due_date = CURDATE()
-             AND (t.created_by = ?
-                  OR t.assigned_to = ?
-                  OR EXISTS (SELECT 1 FROM todo_task_members tm WHERE tm.task_id = t.id AND tm.user_id = ?)
-                  OR EXISTS (SELECT 1 FROM todo_list_members lm WHERE lm.list_id = t.list_id AND lm.user_id = ?)
-                  OR EXISTS (SELECT 1 FROM todo_lists tl WHERE tl.id = t.list_id AND tl.assigned_to = ?))
+             AND ${TASK_ACCESS}
            ORDER BY t.sort_order ASC`,
-          [userId, userId, userId, userId, userId]
+          [userId, userId, userId, userId, userId, userId]
         );
         res.json({ success: true, message: "OK", data: tasks }); break;
       }
@@ -1098,11 +1190,12 @@ export async function getSmartView(req: Request, res: Response): Promise<void> {
            FROM todo_tasks t
            JOIN todo_lists l ON l.id = t.list_id
            JOIN users u ON u.id = t.created_by
-           WHERE t.status = 'pending'
-             AND t.created_by != ?
+           WHERE t.created_by != ?
              AND (t.assigned_to = ?
                   OR EXISTS (SELECT 1 FROM todo_task_members tm WHERE tm.task_id = t.id AND tm.user_id = ?))
-           ORDER BY t.due_date ASC, t.sort_order ASC`,
+             AND (t.status = 'pending'
+                  OR t.completed_at >= DATE_SUB(NOW(), INTERVAL 7 DAY))
+           ORDER BY t.status ASC, t.due_date ASC, t.sort_order ASC`,
           [userId, userId, userId]
         );
         res.json({ success: true, message: "OK", data: tasks }); break;
@@ -1156,13 +1249,9 @@ export async function getSmartView(req: Request, res: Response): Promise<void> {
            JOIN todo_lists l ON l.id = t.list_id
            WHERE t.due_date < CURDATE()
              AND t.status = 'pending'
-             AND (t.created_by = ?
-                  OR t.assigned_to = ?
-                  OR EXISTS (SELECT 1 FROM todo_task_members tm WHERE tm.task_id = t.id AND tm.user_id = ?)
-                  OR EXISTS (SELECT 1 FROM todo_list_members lm WHERE lm.list_id = t.list_id AND lm.user_id = ?)
-                  OR EXISTS (SELECT 1 FROM todo_lists tl WHERE tl.id = t.list_id AND tl.assigned_to = ?))
+             AND ${TASK_ACCESS}
            ORDER BY t.due_date ASC`,
-          [userId, userId, userId, userId, userId]
+          [userId, userId, userId, userId, userId, userId]
         );
         res.json({ success: true, message: "OK", data: tasks }); break;
       }

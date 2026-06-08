@@ -296,8 +296,12 @@ export async function deleteSubscription(req: Request, res: Response): Promise<v
 
 // ─── GET /api/subscriptions/analytics/summary ─────────────────────────────────
 
-export async function analyticsSubscriptions(_req: Request, res: Response): Promise<void> {
+export async function analyticsSubscriptions(req: Request, res: Response): Promise<void> {
   try {
+    const { where: filterWhere, params: filterParams } = buildFilters(req.query as Record<string, string | undefined>);
+    // Strip "WHERE 1=1" to get just the extra AND conditions
+    const extraConds = filterWhere.replace("WHERE 1=1", "").trim();
+
     const [
       [monthlyRow],
       [annualRow],
@@ -311,7 +315,8 @@ export async function analyticsSubscriptions(_req: Request, res: Response): Prom
         `SELECT COALESCE(SUM(s.price), 0) AS total
          FROM subscriptions s
          JOIN subscription_meta_options bc ON bc.id = s.billing_cycle_id
-         WHERE bc.label = 'Monthly'`
+         WHERE bc.label = 'Monthly' ${extraConds}`,
+        [...filterParams]
       ),
       // totalAnnualSpend — active subscriptions normalized to annual
       q<RowDataPacket>(
@@ -327,7 +332,8 @@ export async function analyticsSubscriptions(_req: Request, res: Response): Prom
          FROM subscriptions s
          LEFT JOIN subscription_meta_options bc ON bc.id = s.billing_cycle_id
          JOIN  subscription_meta_options st ON st.id = s.status_id
-         WHERE st.label = 'Active'`
+         WHERE st.label = 'Active' ${extraConds}`,
+        [...filterParams]
       ),
       // byCategory
       q<RowDataPacket>(
@@ -335,8 +341,10 @@ export async function analyticsSubscriptions(_req: Request, res: Response): Prom
                 COALESCE(SUM(s.price), 0) AS total, COUNT(s.id) AS count
          FROM subscriptions s
          LEFT JOIN subscription_meta_options cat ON cat.id = s.category_id
+         WHERE 1=1 ${extraConds}
          GROUP BY s.category_id, cat.label, cat.color
-         ORDER BY total DESC`
+         ORDER BY total DESC`,
+        [...filterParams]
       ),
       // byBillingCycle
       q<RowDataPacket>(
@@ -344,22 +352,27 @@ export async function analyticsSubscriptions(_req: Request, res: Response): Prom
                 COALESCE(SUM(s.price), 0) AS total, COUNT(s.id) AS count
          FROM subscriptions s
          LEFT JOIN subscription_meta_options bc ON bc.id = s.billing_cycle_id
+         WHERE 1=1 ${extraConds}
          GROUP BY s.billing_cycle_id, bc.label, bc.color
-         ORDER BY total DESC`
+         ORDER BY total DESC`,
+        [...filterParams]
       ),
       // expiry counts
       q<RowDataPacket>(
         `SELECT
            SUM(CASE WHEN DATEDIFF(end_date, CURDATE()) BETWEEN 0 AND 7  THEN 1 ELSE 0 END) AS in7Days,
            SUM(CASE WHEN DATEDIFF(end_date, CURDATE()) BETWEEN 0 AND 30 THEN 1 ELSE 0 END) AS in30Days
-         FROM subscriptions`
+         FROM subscriptions s
+         WHERE 1=1 ${extraConds}`,
+        [...filterParams]
       ),
       // totalActive
       q<RowDataPacket>(
         `SELECT COUNT(s.id) AS total
          FROM subscriptions s
          JOIN subscription_meta_options st ON st.id = s.status_id
-         WHERE st.label = 'Active'`
+         WHERE st.label = 'Active' ${extraConds}`,
+        [...filterParams]
       ),
     ]);
 

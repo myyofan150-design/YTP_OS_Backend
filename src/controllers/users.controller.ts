@@ -39,12 +39,15 @@ export async function getUser(req: Request, res: Response): Promise<void> {
 
 export async function createUser(req: Request, res: Response): Promise<void> {
   try {
-    const { name, email, password, role } = req.body as Record<string, string | undefined>;
+    const { name, email, password, role, clientId } = req.body as Record<string, string | undefined>;
     if (!name || !email || !password) {
       res.status(400).json({ success: false, message: "name, email and password are required" }); return;
     }
     if (role === "SUPER_ADMIN" && req.user!.role !== "SUPER_ADMIN") {
       res.status(403).json({ success: false, message: "Only SUPER_ADMIN can create another SUPER_ADMIN" }); return;
+    }
+    if (role === "CLIENT" && !clientId) {
+      res.status(400).json({ success: false, message: "clientId is required when role is CLIENT" }); return;
     }
     const exists = await q<RowDataPacket>("SELECT id FROM users WHERE email = ?", [email]);
     if (exists[0]) { res.status(409).json({ success: false, message: "A user with this email already exists" }); return; }
@@ -52,8 +55,8 @@ export async function createUser(req: Request, res: Response): Promise<void> {
 
     const hash = await bcrypt.hash(password, 12);
     const result = await run(
-      "INSERT INTO users (name, email, password_hash, role, status) VALUES (?, ?, ?, ?, 'ACTIVE')",
-      [name, email, hash, role ?? "EMPLOYEE"]
+      "INSERT INTO users (name, email, password_hash, role, client_id, status) VALUES (?, ?, ?, ?, ?, 'ACTIVE')",
+      [name, email, hash, role ?? "EMPLOYEE", role === "CLIENT" ? (clientId ?? null) : null]
     );
     const newRows = await q<RowDataPacket>(`SELECT ${SEL} FROM users WHERE id = ?`, [result.insertId]);
     await logActivity(req.user!.id, "CREATE_USER", "User", result.insertId, undefined, { name, email, role }, req.ip);

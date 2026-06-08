@@ -71,8 +71,10 @@ import chatRoutes                  from "./routes/chat.routes";
 import settingsRoutes              from "./routes/settings.routes";
 import meRoutes                        from "./routes/me.routes";
 import fieldPermissionsRoutes          from "./routes/field-permissions.routes";
-import shiftsRoutes   from "./routes/shifts.routes";
-import holidaysRoutes from "./routes/holidays.routes";
+import shiftsRoutes       from "./routes/shifts.routes";
+import holidaysRoutes     from "./routes/holidays.routes";
+import clientPortalRoutes from "./routes/client-portal.routes";
+import searchRoutes        from "./routes/search.routes";
 import { startSubscriptionExpiryJob } from "./jobs/subscription-expiry.job";
 import { startTodoReminderJob }        from "./jobs/todo-reminder.job";
 import { startAutoAbsentJob }          from "./jobs/auto-absent.job";
@@ -98,6 +100,8 @@ app.use("/api/me",                 meRoutes);
 app.use("/api/field-permissions",  fieldPermissionsRoutes);
 app.use("/api/shifts",             shiftsRoutes);
 app.use("/api/holidays",           holidaysRoutes);
+app.use("/api/client-portal",      clientPortalRoutes);
+app.use("/api/search",             searchRoutes);
 
 // ─── 404 Handler ──────────────────────────────────────────────────────────
 app.use((_req, res) => {
